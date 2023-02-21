@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	typev3 "github.com/cncf/xds/go/xds/type/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -30,6 +31,7 @@ import (
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
+	headerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/header/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
@@ -49,6 +51,7 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
+	kubelabels "istio.io/istio/pkg/kube/labels"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/proto/merge"
 	"istio.io/istio/pkg/util/strcase"
@@ -215,6 +218,11 @@ func BuildAdditionalAddresses(extrAddresses []string, listenPort uint32, node *m
 	return additionalAddresses
 }
 
+// BuildAddress returns a SocketAddress with the given ip and port or uds.
+func BuildInternalAddress(name string) *core.Address {
+	return BuildInternalAddressWithIdentifier(name, "")
+}
+
 func BuildNetworkAddress(bind string, port uint32, transport istionetworking.TransportProtocol) *core.Address {
 	if port == 0 {
 		return nil
@@ -243,18 +251,6 @@ func SortVirtualHosts(hosts []*route.VirtualHost) {
 	sort.SliceStable(hosts, func(i, j int) bool {
 		return hosts[i].Name < hosts[j].Name
 	})
-}
-
-// IsIstioVersionGE114 checks whether the given Istio version is greater than or equals 1.14.
-func IsIstioVersionGE114(version *model.IstioVersion) bool {
-	return version == nil ||
-		version.Compare(&model.IstioVersion{Major: 1, Minor: 14, Patch: -1}) >= 0
-}
-
-// IsIstioVersionGE115 checks whether the given Istio version is greater than or equals 1.15.
-func IsIstioVersionGE115(version *model.IstioVersion) bool {
-	return version == nil ||
-		version.Compare(&model.IstioVersion{Major: 1, Minor: 15, Patch: -1}) >= 0
 }
 
 // IsIstioVersionGE116 checks whether the given Istio version is greater than or equals 1.16.
@@ -482,17 +478,26 @@ func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
 	return retVal, nil
 }
 
+// BuildNewLbEndpointMetadata adds creates metadata values for a lb endpoint
+func BuildNewLbEndpointMetadata(networkID network.ID, tlsMode, workloadname, namespace string,
+	clusterID cluster.ID, lbls labels.Instance,
+) *core.Metadata {
+	out := &core.Metadata{}
+	BuildLbEndpointMetadata(networkID, tlsMode, workloadname, namespace, clusterID, lbls, out)
+	return out
+}
+
 // BuildLbEndpointMetadata adds metadata values to a lb endpoint
 func BuildLbEndpointMetadata(networkID network.ID, tlsMode, workloadname, namespace string,
-	clusterID cluster.ID, labels labels.Instance,
-) *core.Metadata {
+	clusterID cluster.ID, lbls labels.Instance, metadata *core.Metadata,
+) {
 	if networkID == "" && (tlsMode == "" || tlsMode == model.DisabledTLSModeLabel) &&
 		(!features.EndpointTelemetryLabel || !features.EnableTelemetryLabel) {
-		return nil
+		return
 	}
 
-	metadata := &core.Metadata{
-		FilterMetadata: map[string]*structpb.Struct{},
+	if metadata.FilterMetadata == nil {
+		metadata.FilterMetadata = map[string]*structpb.Struct{}
 	}
 
 	if tlsMode != "" && tlsMode != model.DisabledTLSModeLabel {
@@ -509,24 +514,26 @@ func BuildLbEndpointMetadata(networkID network.ID, tlsMode, workloadname, namesp
 	// Due to performance concern, telemetry metadata is compressed into a semicolon separted string:
 	// workload-name;namespace;canonical-service-name;canonical-service-revision;cluster-id.
 	if features.EndpointTelemetryLabel {
+		// allow defaulting for non-injected cases
+		canonicalName, canonicalRevision := kubelabels.CanonicalService(lbls, workloadname)
+
+		// don't bother sending the default value in config
+		if canonicalRevision == "latest" {
+			canonicalRevision = ""
+		}
+
 		var sb strings.Builder
 		sb.WriteString(workloadname)
 		sb.WriteString(";")
 		sb.WriteString(namespace)
 		sb.WriteString(";")
-		if csn, ok := labels[model.IstioCanonicalServiceLabelName]; ok {
-			sb.WriteString(csn)
-		}
+		sb.WriteString(canonicalName)
 		sb.WriteString(";")
-		if csr, ok := labels[model.IstioCanonicalServiceRevisionLabelName]; ok {
-			sb.WriteString(csr)
-		}
+		sb.WriteString(canonicalRevision)
 		sb.WriteString(";")
 		sb.WriteString(clusterID.String())
 		addIstioEndpointLabel(metadata, "workload", &structpb.Value{Kind: &structpb.Value_StringValue{StringValue: sb.String()}})
 	}
-
-	return metadata
 }
 
 // MaybeApplyTLSModeLabel may or may not update the metadata for the Envoy transport socket matches for auto mTLS.
@@ -780,6 +787,14 @@ func BuildInternalAddressWithIdentifier(name, identifier string) *core.Address {
 	}
 }
 
+func BuildTunnelMetadata(address string, port, tunnelPort int) *core.Metadata {
+	return &core.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{
+			"tunnel": BuildTunnelMetadataStruct(address, address, port, tunnelPort),
+		},
+	}
+}
+
 func BuildTunnelMetadataStruct(tunnelAddress, address string, port, tunnelPort int) *structpb.Struct {
 	st, _ := structpb.NewStruct(map[string]interface{}{
 		// ORIGINAL_DST destination address to tunnel on (usually only differs from "destination" by port)
@@ -805,26 +820,53 @@ func BuildStatefulSessionFilter(svc *model.Service) *hcm.HttpFilter {
 }
 
 func MaybeBuildStatefulSessionFilterConfig(svc *model.Service) *statefulsession.StatefulSession {
-	if features.PersistentSessionLabel == "" || svc == nil {
+	if svc == nil {
 		return nil
 	}
 	sessionCookie := svc.Attributes.Labels[features.PersistentSessionLabel]
-	if sessionCookie == "" {
-		return nil
+	sessionHeader := svc.Attributes.Labels[features.PersistentSessionHeaderLabel]
+
+	switch {
+	case sessionCookie != "":
+		cookieName, cookiePath, found := strings.Cut(sessionCookie, ":")
+		if !found {
+			cookiePath = "/"
+		}
+		return &statefulsession.StatefulSession{
+			SessionState: &core.TypedExtensionConfig{
+				Name: "envoy.http.stateful_session.cookie",
+				TypedConfig: protoconv.MessageToAny(&cookiev3.CookieBasedSessionState{
+					Cookie: &httpv3.Cookie{
+						Path: cookiePath,
+						Ttl:  &durationpb.Duration{Seconds: 120},
+						Name: cookieName,
+					},
+				}),
+			},
+		}
+	case sessionHeader != "":
+		return &statefulsession.StatefulSession{
+			SessionState: &core.TypedExtensionConfig{
+				Name: "envoy.http.stateful_session.header",
+				TypedConfig: protoconv.MessageToAny(&headerv3.HeaderBasedSessionState{
+					Name: sessionHeader,
+				}),
+			},
+		}
 	}
-	cookieName, cookiePath, found := strings.Cut(sessionCookie, ":")
-	if !found {
-		cookiePath = "/"
-	}
-	return &statefulsession.StatefulSession{
-		SessionState: &core.TypedExtensionConfig{
-			Name: "envoy.http.stateful_session.cookie",
-			TypedConfig: protoconv.MessageToAny(&cookiev3.CookieBasedSessionState{
-				Cookie: &httpv3.Cookie{
-					Path: cookiePath,
-					Ttl:  &durationpb.Duration{Seconds: 120},
-					Name: cookieName,
-				},
+	return nil
+}
+
+// InternalListenerSetAddressFilter is a filter for internal listeners that overrides the address based on the metadata
+// from BuildTunnelMetadata
+func InternalListenerSetAddressFilter() *listener.ListenerFilter {
+	v, _ := structpb.NewStruct(map[string]interface{}{})
+	return &listener.ListenerFilter{
+		Name: "set_dst_address",
+		ConfigType: &listener.ListenerFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&typev3.TypedStruct{
+				TypeUrl: "type.googleapis.com/istio.set_internal_dst_address.v1.Config",
+				Value:   v,
 			}),
 		},
 	}

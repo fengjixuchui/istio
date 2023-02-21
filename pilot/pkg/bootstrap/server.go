@@ -169,10 +169,46 @@ type Server struct {
 	// in AddStartFunc
 	internalStop chan struct{}
 
+	webhookInfo *webhookInfo
+
 	statusReporter *distribution.Reporter
 	statusManager  *status.Manager
 	// RWConfigStore is the configstore which allows updates, particularly for status.
 	RWConfigStore model.ConfigStoreController
+}
+
+type webhookInfo struct {
+	mu sync.RWMutex
+	wh *inject.Webhook
+}
+
+func (w *webhookInfo) GetTemplates() map[string]string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.wh != nil {
+		return w.wh.Config.RawTemplates
+	}
+	return map[string]string{}
+}
+
+func (w *webhookInfo) getWebhookConfig() inject.WebhookConfig {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.wh != nil {
+		return w.wh.GetConfig()
+	}
+	return inject.WebhookConfig{}
+}
+
+func (w *webhookInfo) addHandler(fn func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.wh != nil {
+		w.wh.MultiCast.AddHandler(func(c *inject.Config, s string) error {
+			fn()
+			return nil
+		})
+	}
 }
 
 // NewServer creates a new Server instance based on the provided arguments.
@@ -198,20 +234,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		shutdownDuration:        args.ShutdownDuration,
 		internalStop:            make(chan struct{}),
 		istiodCertBundleWatcher: keycertbundle.NewWatcher(),
-	}
-
-	// Used for readiness, monitoring and debug handlers.
-	var (
-		whMu sync.RWMutex
-		wh   *inject.Webhook
-	)
-	whc := func() map[string]string {
-		whMu.RLock()
-		defer whMu.RUnlock()
-		if wh != nil {
-			return wh.Config.RawTemplates
-		}
-		return map[string]string{}
+		webhookInfo:             &webhookInfo{},
 	}
 
 	// Apply custom initialization functions.
@@ -229,7 +252,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		return s.XDSServer.IsServerReady(), nil
 	})
 	s.initServers(args)
-	if err := s.initIstiodAdminServer(args, whc); err != nil {
+	if err := s.initIstiodAdminServer(args, s.webhookInfo.GetTemplates); err != nil {
 		return nil, fmt.Errorf("error initializing debug server: %v", err)
 	}
 	if err := s.serveHTTP(); err != nil {
@@ -301,12 +324,13 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	// common https server for webhooks (e.g. injection, validation)
 	if s.kubeClient != nil {
 		s.initSecureWebhookServer(args)
-		whMu.Lock()
-		wh, err = s.initSidecarInjector(args)
-		whMu.Unlock()
+		wh, err := s.initSidecarInjector(args)
 		if err != nil {
 			return nil, fmt.Errorf("error initializing sidecar injector: %v", err)
 		}
+		s.webhookInfo.mu.Lock()
+		s.webhookInfo.wh = wh
+		s.webhookInfo.mu.Unlock()
 		if err := s.initConfigValidation(args); err != nil {
 			return nil, fmt.Errorf("error initializing config validator: %v", err)
 		}
@@ -324,7 +348,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		&authenticate.ClientCertAuthenticator{},
 	}
 	if args.JwtRule != "" {
-		jwtAuthn, err := initOIDC(args, s.environment.Mesh().TrustDomain)
+		jwtAuthn, err := initOIDC(args)
 		if err != nil {
 			return nil, fmt.Errorf("error initializing OIDC: %v", err)
 		}
@@ -366,7 +390,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	return s, nil
 }
 
-func initOIDC(args *PilotArgs, trustDomain string) (security.Authenticator, error) {
+func initOIDC(args *PilotArgs) (security.Authenticator, error) {
 	// JWTRule is from the JWT_RULE environment variable.
 	// An example of json string for JWTRule is:
 	// `{"issuer": "foo", "jwks_uri": "baz", "audiences": ["aud1", "aud2"]}`.
@@ -376,7 +400,7 @@ func initOIDC(args *PilotArgs, trustDomain string) (security.Authenticator, erro
 		return nil, fmt.Errorf("failed to unmarshal JWT rule: %v", err)
 	}
 	log.Infof("Istiod authenticating using JWTRule: %v", jwtRule)
-	jwtAuthn, err := authenticate.NewJwtAuthenticator(jwtRule, trustDomain)
+	jwtAuthn, err := authenticate.NewJwtAuthenticator(jwtRule)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create the JWT authenticator: %v", err)
 	}
@@ -1013,7 +1037,7 @@ func getDNSNames(args *PilotArgs, host string) []string {
 
 // createPeerCertVerifier creates a SPIFFE certificate verifier with the current istiod configuration.
 func (s *Server) createPeerCertVerifier(tlsOptions TLSOptions) (*spiffe.PeerCertVerifier, error) {
-	customTLSCertsExists, _, _, _ := hasCustomTLSCerts(tlsOptions)
+	customTLSCertsExists, _, _, caCertPath := hasCustomTLSCerts(tlsOptions)
 	if !customTLSCertsExists && s.CA == nil && features.SpiffeBundleEndpoints == "" && !s.isCADisabled() {
 		// Running locally without configured certs - no TLS mode
 		return nil, nil
@@ -1021,8 +1045,8 @@ func (s *Server) createPeerCertVerifier(tlsOptions TLSOptions) (*spiffe.PeerCert
 	peerCertVerifier := spiffe.NewPeerCertVerifier()
 	var rootCertBytes []byte
 	var err error
-	if tlsOptions.CaCertFile != "" {
-		if rootCertBytes, err = os.ReadFile(tlsOptions.CaCertFile); err != nil {
+	if caCertPath != "" {
+		if rootCertBytes, err = os.ReadFile(caCertPath); err != nil {
 			return nil, err
 		}
 	} else {

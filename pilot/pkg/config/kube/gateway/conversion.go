@@ -39,6 +39,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -47,6 +48,8 @@ const (
 	ControllerName               = "istio.io/gateway-controller"
 	gatewayAliasForAnnotationKey = "gateway.istio.io/alias-for"
 	gatewayTLSTerminateModeKey   = "gateway.istio.io/tls-terminate-mode"
+	gatewayNameOverride          = "gateway.istio.io/name-override"
+	gatewaySAOverride            = "gateway.istio.io/service-account"
 )
 
 // KubernetesResources stores all inputs to our conversion
@@ -124,7 +127,7 @@ type Reference struct {
 type ConfigContext struct {
 	KubernetesResources
 	AllowedReferences AllowedReferences
-	GatewayReferences map[parentKey]map[k8s.SectionName]*parentInfo
+	GatewayReferences map[parentKey][]*parentInfo
 
 	// key: referenced resources(e.g. secrets), value: gateway-api resources(e.g. gateways)
 	resourceReferences map[model.ConfigKey][]model.ConfigKey
@@ -418,7 +421,8 @@ func buildHTTPVirtualServices(
 			// for mesh routes, build one VS per namespace+host
 			routeMap = meshRoutes
 			routeKey = ns
-			vsHosts = []string{fmt.Sprintf("%s.%s.svc.%s", gw.OriginalReference.Name, defaultIfNil((*string)(gw.OriginalReference.Namespace), ns), ctx.Domain)}
+			vsHosts = []string{fmt.Sprintf("%s.%s.svc.%s",
+				gw.OriginalReference.Name, ptr.OrDefault(gw.OriginalReference.Namespace, k8s.Namespace(ns)), ctx.Domain)}
 		}
 		if _, f := routeMap[routeKey]; !f {
 			routeMap[routeKey] = make(map[string]*config.Config)
@@ -535,7 +539,7 @@ func hostnameToStringList(h []k8s.Hostname) []string {
 
 func toInternalParentReference(p k8s.ParentReference, localNamespace string) (parentKey, error) {
 	empty := parentKey{}
-	kind := defaultIfNil((*string)(p.Kind), gvk.KubernetesGateway.Kind)
+	kind := ptr.OrDefault((*string)(p.Kind), gvk.KubernetesGateway.Kind)
 	var ik config.GroupVersionKind
 	var ns string
 	// Currently supported types are Gateway and Service
@@ -548,7 +552,7 @@ func toInternalParentReference(p k8s.ParentReference, localNamespace string) (pa
 		return empty, fmt.Errorf("unsupported parentKey: %v/%v", p.Group, kind)
 	}
 	// Unset namespace means "same namespace"
-	ns = defaultIfNil((*string)(p.Namespace), localNamespace)
+	ns = ptr.OrDefault((*string)(p.Namespace), localNamespace)
 	return parentKey{
 		Kind:      ik,
 		Name:      string(p.Name),
@@ -557,35 +561,49 @@ func toInternalParentReference(p k8s.ParentReference, localNamespace string) (pa
 }
 
 func referenceAllowed(
-	p *parentInfo,
+	parent *parentInfo,
 	routeKind config.GroupVersionKind,
-	parent parentKey,
+	parentRef parentReference,
 	hostnames []k8s.Hostname,
 	namespace string,
 ) *ParentError {
-	if parent.Kind == gvk.Service {
+	if parentRef.Kind == gvk.Service {
 		// TODO: check if the service reference is valid
 		if false {
 			return &ParentError{
 				Reason:  ParentErrorParentRefConflict,
-				Message: fmt.Sprintf("parent service: %q is invalid", parent.Name),
+				Message: fmt.Sprintf("parent service: %q is invalid", parentRef.Name),
 			}
 		}
 	} else {
-		// First check the hostnames are a match. This is a bi-directional wildcard match. Only one route
+		// First, check section and port apply. This must come first
+		if parentRef.Port != 0 && parentRef.Port != parent.Port {
+			return &ParentError{
+				Reason:  ParentErrorNotAccepted,
+				Message: fmt.Sprintf("port %v not found", parentRef.Port),
+			}
+		}
+		if len(parentRef.SectionName) > 0 && parentRef.SectionName != parent.SectionName {
+			return &ParentError{
+				Reason:  ParentErrorNotAccepted,
+				Message: fmt.Sprintf("sectionName %q not found", parentRef.SectionName),
+			}
+		}
+
+		// Next check the hostnames are a match. This is a bi-directional wildcard match. Only one route
 		// hostname must match for it to be allowed (but the others will be filtered at runtime)
 		// If either is empty its treated as a wildcard which always matches
 
 		if len(hostnames) == 0 {
 			hostnames = []k8s.Hostname{"*"}
 		}
-		if len(p.Hostnames) > 0 {
+		if len(parent.Hostnames) > 0 {
 			// TODO: the spec actually has a label match, not a string match. That is, *.com does not match *.apple.com
 			// We are doing a string match here
 			matched := false
 			hostMatched := false
 			for _, routeHostname := range hostnames {
-				for _, parentHostNamespace := range p.Hostnames {
+				for _, parentHostNamespace := range parent.Hostnames {
 					spl := strings.Split(parentHostNamespace, "/")
 					parentNamespace, parentHostname := spl[0], spl[1]
 					hostnameMatch := host.Name(parentHostname).Matches(host.Name(routeHostname))
@@ -603,7 +621,7 @@ func referenceAllowed(
 						Reason: ParentErrorNotAllowed,
 						Message: fmt.Sprintf(
 							"hostnames matched parent hostname %q, but namespace %q is not allowed by the parent",
-							p.OriginalHostname, namespace,
+							parent.OriginalHostname, namespace,
 						),
 					}
 				}
@@ -611,7 +629,7 @@ func referenceAllowed(
 					Reason: ParentErrorNoHostname,
 					Message: fmt.Sprintf(
 						"no hostnames matched parent hostname %q",
-						p.OriginalHostname,
+						parent.OriginalHostname,
 					),
 				}
 			}
@@ -619,8 +637,8 @@ func referenceAllowed(
 	}
 	// Also make sure this route kind is allowed
 	matched := false
-	for _, ak := range p.AllowedKinds {
-		if string(ak.Kind) == routeKind.Kind && defaultIfNil((*string)(ak.Group), gvk.GatewayClass.Group) == routeKind.Group {
+	for _, ak := range parent.AllowedKinds {
+		if string(ak.Kind) == routeKind.Kind && ptr.OrDefault((*string)(ak.Group), gvk.GatewayClass.Group) == routeKind.Group {
 			matched = true
 			break
 		}
@@ -634,7 +652,7 @@ func referenceAllowed(
 	return nil
 }
 
-func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*parentInfo, routeRefs []k8s.ParentReference,
+func extractParentReferenceInfo(gateways map[parentKey][]*parentInfo, routeRefs []k8s.ParentReference,
 	hostnames []k8s.Hostname, kind config.GroupVersionKind, localNamespace string,
 ) []routeParentReference {
 	parentRefs := []routeParentReference{}
@@ -644,7 +662,12 @@ func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*pare
 			// Cannot handle the reference. Maybe it is for another controller, so we just ignore it
 			continue
 		}
-		appendParent := func(pr *parentInfo, pk parentKey) {
+		pk := parentReference{
+			parentKey:   ir,
+			SectionName: ptr.OrEmpty(ref.SectionName),
+			Port:        ptr.OrEmpty(ref.Port),
+		}
+		appendParent := func(pr *parentInfo, pk parentReference) {
 			rpi := routeParentReference{
 				InternalName:      pr.InternalName,
 				Hostname:          pr.OriginalHostname,
@@ -661,16 +684,9 @@ func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*pare
 		if ir.Kind == gvk.Service {
 			gk = meshParentKey
 		}
-		if ref.SectionName != nil {
-			// We are selecting a specific section, so attach just that section
-			if pr, f := gateways[gk][*ref.SectionName]; f {
-				appendParent(pr, ir)
-			}
-		} else {
-			// no section name set, match all sections
-			for _, pr := range gateways[gk] {
-				appendParent(pr, ir)
-			}
+		for _, gw := range gateways[gk] {
+			// Append all matches. Note we may be adding mismatch section or ports; this is handled later
+			appendParent(gw, pk)
 		}
 	}
 	return parentRefs
@@ -936,7 +952,7 @@ func buildDestination(ctx ConfigContext, to k8s.BackendRef, ns string) (*istio.D
 		}
 	}
 
-	namespace := defaultIfNil((*string)(to.Namespace), ns)
+	namespace := ptr.OrDefault((*string)(to.Namespace), ns)
 	var invalidBackendErr *ConfigError
 	if nilOrEqual((*string)(to.Group), "") && nilOrEqual((*string)(to.Kind), gvk.Service.Kind) {
 		// Service
@@ -1000,7 +1016,7 @@ func buildDestination(ctx ConfigContext, to k8s.BackendRef, ns string) (*istio.D
 	}
 	return &istio.Destination{}, &ConfigError{
 		Reason:  InvalidDestinationKind,
-		Message: fmt.Sprintf("referencing unsupported backendRef: group %q kind %q", emptyIfNil((*string)(to.Group)), emptyIfNil((*string)(to.Kind))),
+		Message: fmt.Sprintf("referencing unsupported backendRef: group %q kind %q", ptr.OrEmpty(to.Group), ptr.OrEmpty(to.Kind)),
 	}
 }
 
@@ -1247,6 +1263,13 @@ type parentKey struct {
 	Namespace string
 }
 
+type parentReference struct {
+	parentKey
+
+	SectionName k8s.SectionName
+	Port        k8sbeta.PortNumber
+}
+
 var meshGVK = config.GroupVersionKind{
 	Group:   gvk.KubernetesGateway.Group,
 	Version: gvk.KubernetesGateway.Version,
@@ -1277,6 +1300,8 @@ type parentInfo struct {
 	// ReportAttachedRoutes is a callback that should be triggered once all AttachedRoutes are computed, to
 	// actually store the attached route count in the status
 	ReportAttachedRoutes func()
+	SectionName          k8s.SectionName
+	Port                 k8sbeta.PortNumber
 }
 
 // routeParentReference holds information about a route's parent reference
@@ -1322,11 +1347,15 @@ func referencesToInternalNames(parents []routeParentReference) []string {
 	return ret
 }
 
-func convertGateways(r ConfigContext) ([]config.Config, map[parentKey]map[k8s.SectionName]*parentInfo, sets.String) {
+func getDefaultName(name string, kgw *k8s.GatewaySpec) string {
+	return fmt.Sprintf("%v-%v", name, kgw.GatewayClassName)
+}
+
+func convertGateways(r ConfigContext) ([]config.Config, map[parentKey][]*parentInfo, sets.String) {
 	// result stores our generated Istio Gateways
 	result := []config.Config{}
 	// gwMap stores an index to access parentInfo (which corresponds to a Kubernetes Gateway)
-	gwMap := map[parentKey]map[k8s.SectionName]*parentInfo{}
+	gwMap := map[parentKey][]*parentInfo{}
 	// namespaceLabelReferences keeps track of all namespace label keys referenced by Gateways. This is
 	// used to ensure we handle namespace updates for those keys.
 	namespaceLabelReferences := sets.New[string]()
@@ -1408,7 +1437,7 @@ func convertGateways(r ConfigContext) ([]config.Config, map[parentKey]map[k8s.Se
 				Namespace: obj.Namespace,
 			}
 			if _, f := gwMap[ref]; !f {
-				gwMap[ref] = map[k8s.SectionName]*parentInfo{}
+				gwMap[ref] = []*parentInfo{}
 			}
 
 			allowed, _ := generateSupportedKinds(l)
@@ -1416,12 +1445,14 @@ func convertGateways(r ConfigContext) ([]config.Config, map[parentKey]map[k8s.Se
 				InternalName:     obj.Namespace + "/" + gatewayConfig.Name,
 				AllowedKinds:     allowed,
 				Hostnames:        server.Hosts,
-				OriginalHostname: emptyIfNil((*string)(l.Hostname)),
+				OriginalHostname: string(ptr.OrEmpty(l.Hostname)),
+				SectionName:      l.Name,
+				Port:             l.Port,
 			}
 			pri.ReportAttachedRoutes = func() {
 				reportListenerAttachedRoutes(i, obj, pri.AttachedRoutes)
 			}
-			gwMap[ref][l.Name] = pri
+			gwMap[ref] = append(gwMap[ref], pri)
 			result = append(result, gatewayConfig)
 			servers = append(servers, server)
 		}
@@ -1497,14 +1528,14 @@ func convertGateways(r ConfigContext) ([]config.Config, map[parentKey]map[k8s.Se
 		reportGatewayCondition(obj, gatewayConditions)
 	}
 	// Insert a parent for Mesh references.
-	gwMap[meshParentKey] = map[k8s.SectionName]*parentInfo{
-		"": {
+	gwMap[meshParentKey] = []*parentInfo{
+		{
 			InternalName: "mesh",
 			// Mesh has no configurable AllowedKinds, so allow all supported
 			AllowedKinds: []k8s.RouteGroupKind{
-				{Group: (*k8s.Group)(StrPointer(gvk.HTTPRoute.Group)), Kind: k8s.Kind(gvk.HTTPRoute.Kind)},
-				{Group: (*k8s.Group)(StrPointer(gvk.TCPRoute.Group)), Kind: k8s.Kind(gvk.TCPRoute.Kind)},
-				{Group: (*k8s.Group)(StrPointer(gvk.TLSRoute.Group)), Kind: k8s.Kind(gvk.TLSRoute.Kind)},
+				{Group: (*k8s.Group)(ptr.Of(gvk.HTTPRoute.Group)), Kind: k8s.Kind(gvk.HTTPRoute.Kind)},
+				{Group: (*k8s.Group)(ptr.Of(gvk.TCPRoute.Group)), Kind: k8s.Kind(gvk.TCPRoute.Kind)},
+				{Group: (*k8s.Group)(ptr.Of(gvk.TLSRoute.Group)), Kind: k8s.Kind(gvk.TLSRoute.Kind)},
 			},
 		},
 	}
@@ -1560,7 +1591,7 @@ func IsManagedBeta(gw *k8sbeta.GatewaySpec) bool {
 
 func extractGatewayServices(r KubernetesResources, kgw *k8s.GatewaySpec, obj config.Config) ([]string, []string) {
 	if IsManaged(kgw) {
-		return []string{fmt.Sprintf("%s.%s.svc.%v", obj.Name, obj.Namespace, r.Domain)}, nil
+		return []string{fmt.Sprintf("%s.%s.svc.%v", getDefaultName(obj.Name, kgw), obj.Namespace, r.Domain)}, nil
 	}
 	gatewayServices := []string{}
 	skippedAddresses := []string{}
@@ -1703,7 +1734,7 @@ func buildTLS(ctx ConfigContext, tls *k8s.GatewayTLSConfig, gw config.Config, is
 		if err != nil {
 			return nil, err
 		}
-		credNs := defaultIfNil((*string)(tls.CertificateRefs[0].Namespace), namespace)
+		credNs := ptr.OrDefault((*string)(tls.CertificateRefs[0].Namespace), namespace)
 		sameNamespace := credNs == namespace
 		if !sameNamespace && !ctx.AllowedReferences.SecretAllowed(creds.ToResourceName(cred), namespace) {
 			return nil, &ConfigError{
@@ -1732,7 +1763,7 @@ func buildSecretReference(ctx ConfigContext, ref k8s.SecretObjectReference, gw c
 	secret := model.ConfigKey{
 		Kind:      kind.Secret,
 		Name:      string(ref.Name),
-		Namespace: defaultIfNil((*string)(ref.Namespace), gw.Namespace),
+		Namespace: ptr.OrDefault((*string)(ref.Namespace), gw.Namespace),
 	}
 
 	ctx.resourceReferences[secret] = append(ctx.resourceReferences[secret], model.ConfigKey{
@@ -1742,7 +1773,7 @@ func buildSecretReference(ctx ConfigContext, ref k8s.SecretObjectReference, gw c
 	})
 
 	if ctx.Credentials != nil {
-		if key, cert, err := ctx.Credentials.GetKeyAndCert(secret.Name, secret.Namespace); err != nil {
+		if key, cert, _, err := ctx.Credentials.GetKeyCertAndStaple(secret.Name, secret.Namespace); err != nil {
 			return "", &ConfigError{
 				Reason:  InvalidTLS,
 				Message: fmt.Sprintf("invalid certificate reference %v, %v", objectReferenceString(ref), err),
@@ -1760,19 +1791,19 @@ func buildSecretReference(ctx ConfigContext, ref k8s.SecretObjectReference, gw c
 
 func objectReferenceString(ref k8s.SecretObjectReference) string {
 	return fmt.Sprintf("%s/%s/%s.%s",
-		emptyIfNil((*string)(ref.Group)),
-		emptyIfNil((*string)(ref.Kind)),
+		ptr.OrEmpty(ref.Group),
+		ptr.OrEmpty(ref.Kind),
 		ref.Name,
-		emptyIfNil((*string)(ref.Namespace)))
+		ptr.OrEmpty(ref.Namespace))
 }
 
 func parentRefString(ref k8s.ParentReference) string {
 	return fmt.Sprintf("%s/%s/%s/%s.%s",
-		emptyIfNil((*string)(ref.Group)),
-		emptyIfNil((*string)(ref.Kind)),
+		ptr.OrEmpty(ref.Group),
+		ptr.OrEmpty(ref.Kind),
 		ref.Name,
-		emptyIfNil((*string)(ref.SectionName)),
-		emptyIfNil((*string)(ref.Namespace)))
+		ptr.OrEmpty(ref.SectionName),
+		ptr.OrEmpty(ref.Namespace))
 }
 
 // buildHostnameMatch generates a VirtualService.spec.hosts section from a listener
@@ -1830,23 +1861,8 @@ func namespacesFromSelector(localNamespace string, r KubernetesResources, lr *k8
 	return namespaces
 }
 
-func emptyIfNil(s *string) string {
-	return defaultIfNil(s, "")
-}
-
-func defaultIfNil(s *string, d string) string {
-	if s != nil {
-		return *s
-	}
-	return d
-}
-
 func nilOrEqual(have *string, expected string) bool {
 	return have == nil || *have == expected
-}
-
-func StrPointer(s string) *string {
-	return &s
 }
 
 func humanReadableJoin(ss []string) string {

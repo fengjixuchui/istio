@@ -24,6 +24,7 @@ package model
 
 import (
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,8 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"github.com/mitchellh/copystructure"
 	"golang.org/x/exp/maps"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
@@ -42,6 +45,7 @@ import (
 	"istio.io/istio/pkg/config/visibility"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/util/sets"
+	workloadapi "istio.io/istio/pkg/workloadapi"
 )
 
 // Service describes an Istio service (e.g., catalog.mystore.com:8080)
@@ -197,6 +201,10 @@ const (
 	IstioCanonicalServiceRevisionLabelName = "service.istio.io/canonical-revision"
 )
 
+func SupportsTunnel(labels map[string]string, tunnelType string) bool {
+	return sets.New(strings.Split(labels[TunnelLabel], ",")...).Contains(tunnelType)
+}
+
 // Port represents a network port where a service is listening for
 // connections. The port should be annotated with the type of protocol
 // used by the port.
@@ -214,6 +222,10 @@ type Port struct {
 	Protocol protocol.Instance `json:"protocol,omitempty"`
 }
 
+func (p Port) String() string {
+	return fmt.Sprintf("Name:%s Port:%d Protocol:%v", p.Name, p.Port, p.Protocol)
+}
+
 // PortList is a set of ports
 type PortList []*Port
 
@@ -222,7 +234,8 @@ type TrafficDirection string
 
 const (
 	// TrafficDirectionInbound indicates inbound traffic
-	TrafficDirectionInbound TrafficDirection = "inbound"
+	TrafficDirectionInbound    TrafficDirection = "inbound"
+	TrafficDirectionInboundVIP TrafficDirection = "inbound-vip"
 	// TrafficDirectionOutbound indicates outbound traffic
 	TrafficDirectionOutbound TrafficDirection = "outbound"
 
@@ -487,7 +500,7 @@ type IstioEndpoint struct {
 }
 
 func (ep *IstioEndpoint) SupportsTunnel(tunnelType string) bool {
-	return sets.New(strings.Split(ep.Labels[TunnelLabel], ",")...).Contains(tunnelType)
+	return SupportsTunnel(ep.Labels, tunnelType)
 }
 
 // GetLoadBalancingWeight returns the weight for this endpoint, normalized to always be > 0.
@@ -582,10 +595,19 @@ type ServiceAttributes struct {
 	// We translate that to the appropriate node port here.
 	ClusterExternalPorts map[cluster.ID]map[uint32]uint32
 
+	K8sAttributes
+}
+
+type K8sAttributes struct {
 	// Type holds the value of the corev1.Type of the Kubernetes service
+	// spec.Type
 	Type string
 
+	// spec.ExternalName
+	ExternalName string
+
 	// NodeLocal means the proxy will only forward traffic to node local endpoints
+	// spec.InternalTrafficPolicy == Local
 	NodeLocal bool
 }
 
@@ -678,8 +700,8 @@ func (s *ServiceAttributes) Equals(other *ServiceAttributes) bool {
 			return false
 		}
 	}
-	return s.Name == other.Name && s.Namespace == other.Namespace && s.NodeLocal == other.NodeLocal &&
-		s.ServiceRegistry == other.ServiceRegistry && s.Type == other.Type
+	return s.Name == other.Name && s.Namespace == other.Namespace &&
+		s.ServiceRegistry == other.ServiceRegistry && s.K8sAttributes == other.K8sAttributes
 }
 
 // ServiceDiscovery enumerates Istio service instances.
@@ -741,6 +763,101 @@ type ServiceDiscovery interface {
 	// Kubernetes Multi-Cluster Services (MCS) ServiceExport API. Only applies to services in
 	// Kubernetes clusters.
 	MCSServices() []MCSServiceInfo
+	PodInformation(addresses sets.Set[types.NamespacedName]) ([]*WorkloadInfo, []string)
+	AdditionalPodSubscriptions(proxy *Proxy, allAddresses sets.Set[types.NamespacedName], currentSubs sets.Set[types.NamespacedName]) sets.Set[types.NamespacedName]
+	Policies(requested sets.Set[ConfigKey]) []*workloadapi.Authorization
+	AmbientSnapshot() *AmbientSnapshot
+}
+
+type AmbientSnapshot struct {
+	// byPod indexes by Pod IP address.
+	workloads []*WorkloadInfo
+
+	// Map of ServiceAccount -> IP
+	waypoints map[WaypointScope]sets.String
+}
+
+func NewAmbientSnapshot(workloads []*WorkloadInfo, waypoints map[WaypointScope]sets.String) *AmbientSnapshot {
+	return &AmbientSnapshot{
+		workloads: workloads,
+		waypoints: waypoints,
+	}
+}
+
+func (a *AmbientSnapshot) Merge(other *AmbientSnapshot) *AmbientSnapshot {
+	if other == nil {
+		return a
+	}
+	if len(a.waypoints) == 0 && len(a.workloads) == 0 {
+		return other
+	}
+	if len(other.waypoints) == 0 && len(other.workloads) == 0 {
+		return a
+	}
+	a.workloads = append(a.workloads, other.workloads...)
+	for s, i := range other.waypoints {
+		a.waypoints[s].Merge(i)
+	}
+	return a
+}
+
+func (a *AmbientSnapshot) matchesScope(scope WaypointScope, w *WorkloadInfo) bool {
+	if len(scope.ServiceAccount) == 0 {
+		// We are a namespace wide waypoint. SA scope take precedence.
+		// Check if there is one for this workloads service account
+		if _, f := a.waypoints[WaypointScope{Namespace: scope.Namespace, ServiceAccount: w.ServiceAccount}]; f {
+			return false
+		}
+	}
+	if scope.ServiceAccount != "" && (w.ServiceAccount != scope.ServiceAccount) {
+		return false
+	}
+	if w.Namespace != scope.Namespace {
+		return false
+	}
+	// Filter out waypoints.
+	if w.Labels[constants.ManagedGatewayLabel] == constants.ManagedGatewayMeshControllerLabel {
+		return false
+	}
+	return true
+}
+
+func (a *AmbientSnapshot) WorkloadsForWaypoint(scope WaypointScope) []*WorkloadInfo {
+	res := []*WorkloadInfo{}
+	// TODO: try to precompute
+	for _, w := range a.workloads {
+		if a.matchesScope(scope, w) {
+			res = append(res, w)
+		}
+	}
+	return res
+}
+
+func (a *AmbientSnapshot) Waypoint(scope WaypointScope) sets.Set[netip.Addr] {
+	res := sets.New[netip.Addr]()
+	for ip := range a.waypoints[scope] {
+		res.Insert(netip.MustParseAddr(ip))
+	}
+
+	return res
+}
+
+type WorkloadInfo struct {
+	*workloadapi.Workload
+	// Labels for the workload. Note these are only used internally, not sent over XDS
+	Labels map[string]string
+}
+
+func (i *WorkloadInfo) Clone() *WorkloadInfo {
+	return &WorkloadInfo{
+		Workload: proto.Clone(i).(*workloadapi.Workload),
+		Labels:   maps.Clone(i.Labels),
+	}
+}
+
+func (i WorkloadInfo) ResourceName() string {
+	ii, _ := netip.AddrFromSlice(i.Address)
+	return ii.String()
 }
 
 // MCSServiceInfo combines the name of a service with a particular Kubernetes cluster. This
@@ -811,6 +928,14 @@ func (ports PortList) Equals(other PortList) bool {
 		}
 	}
 	return true
+}
+
+func (ports PortList) String() string {
+	var sp []string
+	for _, p := range ports {
+		sp = append(sp, p.String())
+	}
+	return strings.Join(sp, ", ")
 }
 
 // External predicate checks whether the service is external

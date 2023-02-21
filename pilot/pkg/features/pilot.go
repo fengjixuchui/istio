@@ -20,6 +20,7 @@ import (
 
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/jwt"
@@ -122,7 +123,13 @@ var (
 	PersistentSessionLabel = env.Register(
 		"PILOT_PERSISTENT_SESSION_LABEL",
 		"istio.io/persistent-session",
-		"If not empty, services with this label will use persistent sessions",
+		"If not empty, services with this label will use cookie based persistent sessions",
+	).Get()
+
+	PersistentSessionHeaderLabel = env.Register(
+		"PILOT_PERSISTENT_SESSION_HEADER_LABEL",
+		"istio.io/persistent-session-header",
+		"If not empty, services with this label will use header based persistent sessions",
 	).Get()
 
 	DrainingLabel = env.Register(
@@ -448,6 +455,33 @@ var (
 		return strings.Split(cidr, ",")
 	}()
 
+	CATrustedNodeAccounts = func() sets.Set[types.NamespacedName] {
+		accounts := env.Register(
+			"CA_TRUSTED_NODE_ACCOUNTS",
+			"",
+			"If set, the list of service accounts that are allowed to use node authentication for CSRs. "+
+				"Node authentication allows an identity to create CSRs on behalf of other identities, but only if there is a pod "+
+				"running on the same node with that identity. "+
+				"This is intended for use with node proxies.",
+		).Get()
+		res := sets.New[types.NamespacedName]()
+		if accounts == "" {
+			return res
+		}
+		for _, v := range strings.Split(accounts, ",") {
+			ns, sa, valid := strings.Cut(v, "/")
+			if !valid {
+				log.Warnf("Invalid CA_TRUSTED_NODE_ACCOUNTS, ignoring: %v", v)
+				continue
+			}
+			res.Insert(types.NamespacedName{
+				Namespace: ns,
+				Name:      sa,
+			})
+		}
+		return res
+	}()
+
 	EnableServiceEntrySelectPods = env.Register("PILOT_ENABLE_SERVICEENTRY_SELECT_PODS", true,
 		"If enabled, service entries with selectors will select pods from the cluster. "+
 			"It is safe to disable it if you are quite sure you don't need this feature").Get()
@@ -573,6 +607,11 @@ var (
 		false,
 		"If enabled, HBONE support can be configured for proxies. "+
 			"Note: proxies must opt in on a per-proxy basis with ENABLE_HBONE to actually get HBONE config, in addition to this flag.").Get()
+
+	EnableAmbientControllers = env.Register(
+		"PILOT_ENABLE_AMBIENT_CONTROLLERS",
+		false,
+		"If enabled, controllers required for ambient will run. This is required to run ambient mesh.").Get()
 
 	StripHostPort = env.Register("ISTIO_GATEWAY_STRIP_HOST_PORT", false,
 		"If enabled, Gateway will remove any port from host/authority header "+

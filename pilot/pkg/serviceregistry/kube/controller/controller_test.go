@@ -448,7 +448,9 @@ func TestGetProxyServiceInstances(t *testing.T) {
 						Name:            "svc1",
 						Namespace:       "nsa",
 						LabelSelectors:  map[string]string{"app": "prod-app"},
-						Type:            string(corev1.ServiceTypeClusterIP),
+						K8sAttributes: model.K8sAttributes{
+							Type: string(corev1.ServiceTypeClusterIP),
+						},
 					},
 				},
 				ServicePort: &model.Port{Name: "tcp-port", Port: 8080, Protocol: protocol.TCP},
@@ -525,7 +527,9 @@ func TestGetProxyServiceInstances(t *testing.T) {
 						Name:            "svc1",
 						Namespace:       "nsa",
 						LabelSelectors:  map[string]string{"app": "prod-app"},
-						Type:            string(corev1.ServiceTypeClusterIP),
+						K8sAttributes: model.K8sAttributes{
+							Type: string(corev1.ServiceTypeClusterIP),
+						},
 					},
 				},
 				ServicePort: &model.Port{Name: "tcp-port", Port: 8080, Protocol: protocol.TCP},
@@ -599,7 +603,9 @@ func TestGetProxyServiceInstances(t *testing.T) {
 						Name:            "svc1",
 						Namespace:       "nsa",
 						LabelSelectors:  map[string]string{"app": "prod-app"},
-						Type:            string(corev1.ServiceTypeClusterIP),
+						K8sAttributes: model.K8sAttributes{
+							Type: string(corev1.ServiceTypeClusterIP),
+						},
 					},
 				},
 				ServicePort: &model.Port{Name: "tcp-port", Port: 8080, Protocol: protocol.TCP},
@@ -2143,7 +2149,12 @@ func createService(controller *FakeController, name, namespace string, annotatio
 
 	_, err := controller.client.Kube().CoreV1().Services(namespace).Create(context.TODO(), service, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("Cannot create service %s in namespace %s (error: %v)", name, namespace, err)
+		if errors.IsAlreadyExists(err) {
+			_, err = controller.client.Kube().CoreV1().Services(namespace).Update(context.TODO(), service, metav1.UpdateOptions{})
+		}
+		if err != nil {
+			t.Fatalf("Cannot create service %s in namespace %s (error: %v)", name, namespace, err)
+		}
 	}
 }
 
@@ -3097,6 +3108,10 @@ func TestStripPodUnusedFields(t *testing.T) {
 			Namespace: "default",
 			Labels: map[string]string{
 				"app": "test",
+			},
+			Annotations: map[string]string{
+				"annotation1": "foo",
+				"annotation2": "bar",
 			},
 		},
 		Spec: corev1.PodSpec{

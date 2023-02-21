@@ -94,7 +94,7 @@ func EnqueueForParentHandler(q Queue, kind config.GroupVersionKind) func(obj Obj
 				log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
 				continue
 			}
-			if refGV == kind.Kubernetes().GroupVersion() {
+			if refGV.Group == kind.Group && ref.Kind == kind.Kind {
 				// We found a parent we care about, add it to the queue
 				q.Add(types.NamespacedName{
 					// Reference doesn't have namespace, but its always same-namespace, so use objects
@@ -105,6 +105,88 @@ func EnqueueForParentHandler(q Queue, kind config.GroupVersionKind) func(obj Obj
 		}
 	}
 	return handler
+}
+
+// EventType represents a registry update event
+type EventType int
+
+const (
+	// EventAdd is sent when an object is added
+	EventAdd EventType = iota
+
+	// EventUpdate is sent when an object is modified
+	// Captures the modified object
+	EventUpdate
+
+	// EventDelete is sent when an object is deleted
+	// Captures the object at the last known state
+	EventDelete
+)
+
+func (event EventType) String() string {
+	out := "unknown"
+	switch event {
+	case EventAdd:
+		out = "add"
+	case EventUpdate:
+		out = "update"
+	case EventDelete:
+		out = "delete"
+	}
+	return out
+}
+
+type Event struct {
+	Old   Object
+	New   Object
+	Event EventType
+}
+
+func (e Event) Latest() Object {
+	if e.New != nil {
+		return e.New
+	}
+	return e.Old
+}
+
+func FromEventHandler(handler func(o Event)) cache.ResourceEventHandler {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			o := ExtractObject(obj)
+			if o == nil {
+				return
+			}
+			handler(Event{
+				New:   o,
+				Event: EventAdd,
+			})
+		},
+		UpdateFunc: func(oldInterface, newInterface any) {
+			oldObj := ExtractObject(oldInterface)
+			if oldObj == nil {
+				return
+			}
+			newObj := ExtractObject(newInterface)
+			if newObj == nil {
+				return
+			}
+			handler(Event{
+				Old:   oldObj,
+				New:   newObj,
+				Event: EventUpdate,
+			})
+		},
+		DeleteFunc: func(obj any) {
+			o := ExtractObject(obj)
+			if o == nil {
+				return
+			}
+			handler(Event{
+				Old:   o,
+				Event: EventDelete,
+			})
+		},
+	}
 }
 
 // ObjectHandler returns a handler that will act on the latest version of an object

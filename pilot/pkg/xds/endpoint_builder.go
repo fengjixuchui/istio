@@ -110,7 +110,7 @@ func NewEndpointBuilder(clusterName string, proxy *model.Proxy, push *model.Push
 	return b
 }
 
-func (b EndpointBuilder) DestinationRule() *networkingapi.DestinationRule {
+func (b *EndpointBuilder) DestinationRule() *networkingapi.DestinationRule {
 	if dr := b.destinationRule.GetRule(); dr != nil {
 		return dr.Spec.(*networkingapi.DestinationRule)
 	}
@@ -118,7 +118,7 @@ func (b EndpointBuilder) DestinationRule() *networkingapi.DestinationRule {
 }
 
 // Key provides the eds cache key and should include any information that could change the way endpoints are generated.
-func (b EndpointBuilder) Key() string {
+func (b *EndpointBuilder) Key() string {
 	// nolint: gosec
 	// Not security sensitive code
 	h := hash.New()
@@ -174,14 +174,14 @@ func (b EndpointBuilder) Key() string {
 	return h.Sum()
 }
 
-func (b EndpointBuilder) Cacheable() bool {
+func (b *EndpointBuilder) Cacheable() bool {
 	// If service is not defined, we cannot do any caching as we will not have a way to
 	// invalidate the results.
 	// Service being nil means the EDS will be empty anyways, so not much lost here.
 	return b.service != nil
 }
 
-func (b EndpointBuilder) DependentConfigs() []model.ConfigHash {
+func (b *EndpointBuilder) DependentConfigs() []model.ConfigHash {
 	drs := b.destinationRule.GetFrom()
 	configs := make([]model.ConfigHash, 0, len(drs)+1)
 	if b.destinationRule != nil {
@@ -199,12 +199,6 @@ func (b EndpointBuilder) DependentConfigs() []model.ConfigHash {
 		}.HashCode())
 	}
 	return configs
-}
-
-var edsDependentTypes = []kind.Kind{kind.PeerAuthentication}
-
-func (b EndpointBuilder) DependentTypes() []kind.Kind {
-	return edsDependentTypes
 }
 
 type LocalityEndpoints struct {
@@ -300,16 +294,6 @@ func (b *EndpointBuilder) buildLocalityLbEndpointsFromShards(
 				}
 			}
 
-			locLbEps, found := localityEpMap[ep.Locality.Label]
-			if !found {
-				locLbEps = &LocalityEndpoints{
-					llbEndpoints: endpoint.LocalityLbEndpoints{
-						Locality:    util.ConvertLocality(ep.Locality.Label),
-						LbEndpoints: make([]*endpoint.LbEndpoint, 0, len(endpoints)),
-					},
-				}
-				localityEpMap[ep.Locality.Label] = locLbEps
-			}
 			// Currently the HBONE implementation leads to different endpoint generation depending on if the
 			// client proxy supports HBONE or not. This breaks the cache.
 			// For now, just disable caching if the global HBONE flag is enabled.
@@ -319,6 +303,17 @@ func (b *EndpointBuilder) buildLocalityLbEndpointsFromShards(
 					continue
 				}
 				ep.EnvoyEndpoint = eep
+			}
+
+			locLbEps, found := localityEpMap[ep.Locality.Label]
+			if !found {
+				locLbEps = &LocalityEndpoints{
+					llbEndpoints: endpoint.LocalityLbEndpoints{
+						Locality:    util.ConvertLocality(ep.Locality.Label),
+						LbEndpoints: make([]*endpoint.LbEndpoint, 0, len(endpoints)),
+					},
+				}
+				localityEpMap[ep.Locality.Label] = locLbEps
 			}
 			// detect if mTLS is possible for this endpoint, used later during ep filtering
 			// this must be done while converting IstioEndpoints because we still have workload labels
@@ -409,7 +404,7 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint) *endpoint.
 	// Istio telemetry depends on the metadata value being set for endpoints in the mesh.
 	// Istio endpoint level tls transport socket configuration depends on this logic
 	// Do not remove pilot/pkg/xds/fake.go
-	util.BuildLbEndpointMetadata(e.Network, e.TLSMode, e.WorkloadName, e.Namespace, e.Locality.ClusterID, e.Labels, ep.Metadata)
+	util.AppendLbEndpointMetadata(e.Metadata(), ep.Metadata)
 
 	address, port := e.Address, e.EndpointPort
 	tunnelAddress, tunnelPort := address, model.HBoneInboundListenPort

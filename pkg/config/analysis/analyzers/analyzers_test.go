@@ -20,7 +20,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	. "github.com/onsi/gomega"
 
@@ -421,6 +420,7 @@ var testGrid = []testCase{
 			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin/httpbin-bogus-ns"},
 			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin/httpbin-bogus-not-ns"},
 			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin/httpbin-bogus-not-ns"},
+			{msg.NoMatchingWorkloadsFound, "AuthorizationPolicy test-ambient/no-workload"},
 		},
 	},
 	{
@@ -499,7 +499,7 @@ var testGrid = []testCase{
 			"testdata/virtualservice_dupmatches.yaml",
 			"testdata/virtualservice_overlappingmatches.yaml",
 		},
-		analyzer: schemaValidation.CollectionValidationAnalyzer(collections.IstioNetworkingV1Alpha3Virtualservices),
+		analyzer: schemaValidation.CollectionValidationAnalyzer(collections.VirtualService),
 		expected: []message{
 			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-match"},
 			{msg.VirtualServiceUnreachableRule, "VirtualService foo/sample-foo-cluster01"},
@@ -759,6 +759,28 @@ var testGrid = []testCase{
 			{msg.InvalidTelemetryProvider, "Telemetry istio-system/mesh-default"},
 		},
 	},
+	{
+		name:       "telemetrySelector",
+		inputFiles: []string{"testdata/telemetry-selector.yaml"},
+		analyzer:   &telemetry.SelectorAnalyzer{},
+		expected: []message{
+			{msg.ReferencedResourceNotFound, "Telemetry default/maps-to-nonexistent"},
+			{msg.ReferencedResourceNotFound, "Telemetry other/maps-to-different-ns"},
+			{msg.ConflictingTelemetryWorkloadSelectors, "Telemetry default/dupe-1"},
+			{msg.ConflictingTelemetryWorkloadSelectors, "Telemetry default/dupe-2"},
+			{msg.ConflictingTelemetryWorkloadSelectors, "Telemetry default/overlap-1"},
+			{msg.ConflictingTelemetryWorkloadSelectors, "Telemetry default/overlap-2"},
+		},
+	},
+	{
+		name:       "telemetryDefaultSelector",
+		inputFiles: []string{"testdata/telemetry-default-selector.yaml"},
+		analyzer:   &telemetry.DefaultSelectorAnalyzer{},
+		expected: []message{
+			{msg.MultipleTelemetriesWithoutWorkloadSelectors, "Telemetry ns2/has-conflict-2"},
+			{msg.MultipleTelemetriesWithoutWorkloadSelectors, "Telemetry ns2/has-conflict-1"},
+		},
+	},
 }
 
 // regex patterns for analyzer names that should be explicitly ignored for testing
@@ -877,7 +899,7 @@ func TestAnalyzersHaveDescription(t *testing.T) {
 }
 
 func setupAnalyzerForCase(tc testCase, cr local.CollectionReporterFn) (*local.IstiodAnalyzer, error) {
-	sa := local.NewSourceAnalyzer(analysis.Combine("testCase", tc.analyzer), "", "istio-system", cr, true, 10*time.Second)
+	sa := local.NewSourceAnalyzer(analysis.Combine("testCase", tc.analyzer), "", "istio-system", cr)
 
 	// If a mesh config file is specified, use it instead of the defaults
 	if tc.meshConfigFile != "" {

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package crdclient
+package collections
 
-// nolint: lll
-//go:generate go run $REPO_ROOT/pilot/pkg/config/kube/crdclient/gen/main.go --template $REPO_ROOT/pilot/pkg/config/kube/crdclient/gen/types.go.tmpl --output $REPO_ROOT/pilot/pkg/config/kube/crdclient/types.gen.go
+var Istio = Pilot.Add(MeshNetworks).Add(MeshConfig)

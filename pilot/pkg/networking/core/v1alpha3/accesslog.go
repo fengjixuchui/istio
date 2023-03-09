@@ -36,6 +36,9 @@ const (
 	// EnvoyServerName for istio's envoy
 	EnvoyServerName = "istio-envoy"
 
+	// EnvoyWaypoint for ambient waypoint
+	EnvoyWaypoint = "waypoint-envoy"
+
 	celFilter                          = "envoy.access_loggers.extension_filters.cel"
 	listenerEnvoyAccessLogFriendlyName = "listener_envoy_accesslog"
 
@@ -102,6 +105,9 @@ func (b *AccessLogBuilder) setTCPAccessLog(push *model.PushContext, proxy *model
 func buildAccessLogFromTelemetry(cfgs []model.LoggingConfig, forListener bool) []*accesslog.AccessLog {
 	als := make([]*accesslog.AccessLog, 0, len(cfgs))
 	for _, c := range cfgs {
+		if c.Disabled {
+			continue
+		}
 		filters := make([]*accesslog.AccessLogFilter, 0, 2)
 		if forListener {
 			filters = append(filters, addAccessLogFilter())

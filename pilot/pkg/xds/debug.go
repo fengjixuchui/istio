@@ -45,7 +45,6 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/config/xds"
-	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
@@ -116,20 +115,21 @@ type AdsClients struct {
 
 // SyncStatus is the synchronization status between Pilot and a given Envoy
 type SyncStatus struct {
-	ClusterID            string `json:"cluster_id,omitempty"`
-	ProxyID              string `json:"proxy,omitempty"`
-	ProxyVersion         string `json:"proxy_version,omitempty"`
-	IstioVersion         string `json:"istio_version,omitempty"`
-	ClusterSent          string `json:"cluster_sent,omitempty"`
-	ClusterAcked         string `json:"cluster_acked,omitempty"`
-	ListenerSent         string `json:"listener_sent,omitempty"`
-	ListenerAcked        string `json:"listener_acked,omitempty"`
-	RouteSent            string `json:"route_sent,omitempty"`
-	RouteAcked           string `json:"route_acked,omitempty"`
-	EndpointSent         string `json:"endpoint_sent,omitempty"`
-	EndpointAcked        string `json:"endpoint_acked,omitempty"`
-	ExtensionConfigSent  string `json:"extensionconfig_sent,omitempty"`
-	ExtensionConfigAcked string `json:"extensionconfig_acked,omitempty"`
+	ClusterID            string         `json:"cluster_id,omitempty"`
+	ProxyID              string         `json:"proxy,omitempty"`
+	ProxyType            model.NodeType `json:"proxy_type,omitempty"`
+	ProxyVersion         string         `json:"proxy_version,omitempty"`
+	IstioVersion         string         `json:"istio_version,omitempty"`
+	ClusterSent          string         `json:"cluster_sent,omitempty"`
+	ClusterAcked         string         `json:"cluster_acked,omitempty"`
+	ListenerSent         string         `json:"listener_sent,omitempty"`
+	ListenerAcked        string         `json:"listener_acked,omitempty"`
+	RouteSent            string         `json:"route_sent,omitempty"`
+	RouteAcked           string         `json:"route_acked,omitempty"`
+	EndpointSent         string         `json:"endpoint_sent,omitempty"`
+	EndpointAcked        string         `json:"endpoint_acked,omitempty"`
+	ExtensionConfigSent  string         `json:"extensionconfig_sent,omitempty"`
+	ExtensionConfigAcked string         `json:"extensionconfig_acked,omitempty"`
 }
 
 // SyncedVersions shows what resourceVersion of a given resource has been acked by Envoy.
@@ -271,6 +271,7 @@ func (s *DiscoveryServer) Syncz(w http.ResponseWriter, req *http.Request) {
 		if node != nil {
 			syncz = append(syncz, SyncStatus{
 				ProxyID:              node.ID,
+				ProxyType:            node.Type,
 				ClusterID:            node.Metadata.ClusterID.String(),
 				IstioVersion:         node.Metadata.IstioVersion,
 				ClusterSent:          con.NonceSent(v3.ClusterType),
@@ -915,7 +916,7 @@ func (s *DiscoveryServer) pushStatusHandler(w http.ResponseWriter, req *http.Req
 // PushContextDebug holds debug information for push context.
 type PushContextDebug struct {
 	AuthorizationPolicies *model.AuthorizationPolicies
-	NetworkGateways       map[network.ID][]model.NetworkGateway
+	NetworkGateways       []model.NetworkGateway
 }
 
 // pushContextHandler dumps the current PushContext
@@ -927,7 +928,7 @@ func (s *DiscoveryServer) pushContextHandler(w http.ResponseWriter, req *http.Re
 	}
 	push.AuthorizationPolicies = pc.AuthzPolicies
 	if pc.NetworkManager() != nil {
-		push.NetworkGateways = pc.NetworkManager().GatewaysByNetwork()
+		push.NetworkGateways = pc.NetworkManager().AllGateways()
 	}
 
 	writeJSON(w, push, req)

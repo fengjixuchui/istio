@@ -17,7 +17,6 @@ package controller
 import (
 	"bytes"
 	"net/netip"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +38,7 @@ import (
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/kclient"
 	kubelabels "istio.io/istio/pkg/kube/labels"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/util/sets"
@@ -56,10 +56,15 @@ type AmbientIndex struct {
 	byPod map[string]*model.WorkloadInfo
 
 	// Map of ServiceAccount -> IP
+	// TODO: currently, this is derived from pods. To be agnostic to the implementation,
+	// we should actually be looking at Gateway.status.addresses.
+	// This may be an external address (possibly even a DNS name we need to resolve), an arbitrary IP,
+	// or a reference to a service.
+	// If its a reference to a Service then we can find the underlying pods in that service, as an optimization.
 	waypoints map[model.WaypointScope]sets.String
 
 	// serviceVipIndex maintains an index of VIP -> Service
-	serviceVipIndex *controllers.Index[*v1.Service, string]
+	serviceVipIndex *kclient.Index[*v1.Service, string]
 }
 
 // Lookup finds a given IP address.
@@ -219,6 +224,9 @@ func (a *AmbientIndex) matchesScope(scope model.WaypointScope, w *model.Workload
 }
 
 func (c *Controller) Policies(requested sets.Set[model.ConfigKey]) []*workloadapi.Authorization {
+	if !c.configCluster {
+		return nil
+	}
 	cfgs := c.configController.List(gvk.AuthorizationPolicy, metav1.NamespaceAll)
 	l := len(cfgs)
 	if len(requested) > 0 {
@@ -243,15 +251,7 @@ func (c *Controller) Policies(requested sets.Set[model.ConfigKey]) []*workloadap
 	return res
 }
 
-func isNil(v interface{}) bool {
-	return v == nil || (reflect.ValueOf(v).Kind() == reflect.Ptr && reflect.ValueOf(v).IsNil())
-}
-
 func (c *Controller) selectorAuthorizationPolicies(ns string, lbls map[string]string) []string {
-	// Since this is an interface a normal nil check doesn't work (...)
-	if isNil(c.configController) {
-		return nil
-	}
 	global := c.configController.List(gvk.AuthorizationPolicy, c.meshWatcher.Mesh().GetRootNamespace())
 	local := c.configController.List(gvk.AuthorizationPolicy, ns)
 	res := sets.New[string]()
@@ -333,15 +333,7 @@ func (c *Controller) getPodsInPolicy(ns string, sel map[string]string) []*v1.Pod
 	if ns == c.meshWatcher.Mesh().GetRootNamespace() {
 		ns = metav1.NamespaceAll
 	}
-	allPods := c.podsClient.List(ns, klabels.Everything())
-	var pods []*v1.Pod
-	for _, pod := range allPods {
-		if labels.Instance(sel).SubsetOf(pod.Labels) {
-			pods = append(pods, pod)
-		}
-	}
-
-	return pods
+	return c.podsClient.List(ns, klabels.ValidatedSetSelector(sel))
 }
 
 func convertAuthorizationPolicy(rootns string, obj config.Config) *workloadapi.Authorization {
@@ -686,7 +678,7 @@ func (c *Controller) setupIndex() *AmbientIndex {
 		},
 	}
 	c.services.AddEventHandler(serviceHandler)
-	idx.serviceVipIndex = controllers.CreateIndex[*v1.Service, string](c.client.KubeInformer().Core().V1().Services().Informer(), getVIPs)
+	idx.serviceVipIndex = kclient.CreateIndex[*v1.Service](c.services, getVIPs)
 	return &idx
 }
 
@@ -783,8 +775,7 @@ func (a *AmbientIndex) handlePods(pods []*v1.Pod, c *Controller) {
 func (a *AmbientIndex) handleService(obj any, isDelete bool, c *Controller) map[model.ConfigKey]struct{} {
 	svc := controllers.Extract[*v1.Service](obj)
 	vips := getVIPs(svc)
-	allPods := c.podsClient.List(svc.Namespace, klabels.Everything())
-	pods := getPodsInService(allPods, svc)
+	pods := c.getPodsInService(svc)
 	var wls []*model.WorkloadInfo
 	for _, p := range pods {
 		// Can be nil if it's not ready, hostNetwork, etc
@@ -821,6 +812,14 @@ func (a *AmbientIndex) handleService(obj any, isDelete bool, c *Controller) map[
 		}
 	}
 	return updates
+}
+
+func (c *Controller) getPodsInService(svc *v1.Service) []*v1.Pod {
+	if svc.Spec.Selector == nil {
+		// services with nil selectors match nothing, not everything.
+		return nil
+	}
+	return c.podsClient.List(svc.Namespace, klabels.ValidatedSetSelector(svc.Spec.Selector))
 }
 
 // PodInformation returns all WorkloadInfo's in the cluster.

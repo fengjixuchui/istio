@@ -17,6 +17,7 @@ import (
 
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
+	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
@@ -798,6 +799,25 @@ var translationMap = map[config.GroupVersionKind]func(r runtime.Object) config.C
 			Status: &obj.Status,
 		}
 	},
+	gvk.CertificateSigningRequest: func(r runtime.Object) config.Config {
+		obj := r.(*k8sioapicertificatesv1.CertificateSigningRequest)
+		return config.Config{
+			Meta: config.Meta{
+				GroupVersionKind:  gvk.CertificateSigningRequest,
+				Name:              obj.Name,
+				Namespace:         obj.Namespace,
+				Labels:            obj.Labels,
+				Annotations:       obj.Annotations,
+				ResourceVersion:   obj.ResourceVersion,
+				CreationTimestamp: obj.CreationTimestamp.Time,
+				OwnerReferences:   obj.OwnerReferences,
+				UID:               string(obj.UID),
+				Generation:        obj.Generation,
+			},
+			Spec:   &obj.Spec,
+			Status: &obj.Status,
+		}
+	},
 	gvk.ConfigMap: func(r runtime.Object) config.Config {
 		obj := r.(*k8sioapicorev1.ConfigMap)
 		return config.Config{
@@ -1371,6 +1391,24 @@ var translationMap = map[config.GroupVersionKind]func(r runtime.Object) config.C
 			},
 			Spec:   &obj.Spec,
 			Status: &obj.Status,
+		}
+	},
+	gvk.ValidatingWebhookConfiguration: func(r runtime.Object) config.Config {
+		obj := r.(*k8sioapiadmissionregistrationv1.ValidatingWebhookConfiguration)
+		return config.Config{
+			Meta: config.Meta{
+				GroupVersionKind:  gvk.ValidatingWebhookConfiguration,
+				Name:              obj.Name,
+				Namespace:         obj.Namespace,
+				Labels:            obj.Labels,
+				Annotations:       obj.Annotations,
+				ResourceVersion:   obj.ResourceVersion,
+				CreationTimestamp: obj.CreationTimestamp.Time,
+				OwnerReferences:   obj.OwnerReferences,
+				UID:               string(obj.UID),
+				Generation:        obj.Generation,
+			},
+			Spec: obj,
 		}
 	},
 	gvk.VirtualService: func(r runtime.Object) config.Config {

@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/keycertbundle"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -32,6 +33,13 @@ import (
 const (
 	// CACertNamespaceConfigMap is the name of the ConfigMap in each namespace storing the root cert of non-Kube CA.
 	CACertNamespaceConfigMap = "istio-ca-root-cert"
+
+	// maxRetries is the number of times a namespace will be retried before it is dropped out of the queue.
+	// With the current rate-limiter in use (5ms*2^(maxRetries-1)) the following numbers represent the
+	// sequence of delays between successive queuing of a namespace.
+	//
+	// 5ms, 10ms, 20ms, 40ms, 80ms
+	maxRetries = 5
 )
 
 var configMapLabel = map[string]string{"istio.io/config": "true"}
@@ -57,7 +65,9 @@ func NewNamespaceController(kubeClient kube.Client, caBundleWatcher *keycertbund
 		caBundleWatcher:           caBundleWatcher,
 		DiscoveryNamespacesFilter: discoveryNamespacesFilter,
 	}
-	c.queue = controllers.NewQueue("namespace controller", controllers.WithReconciler(c.insertDataForNamespace))
+	c.queue = controllers.NewQueue("namespace controller",
+		controllers.WithReconciler(c.insertDataForNamespace),
+		controllers.WithMaxAttempts(maxRetries))
 
 	c.configmaps = kclient.New[*v1.ConfigMap](kubeClient)
 	c.namespaces = kclient.New[*v1.Namespace](kubeClient)
@@ -78,6 +88,10 @@ func NewNamespaceController(kubeClient kube.Client, caBundleWatcher *keycertbund
 		return true
 	}))
 	c.namespaces.AddEventHandler(controllers.FilteredObjectSpecHandler(c.queue.AddObject, func(o controllers.Object) bool {
+		if features.InformerWatchNamespace != "" && features.InformerWatchNamespace != o.GetName() {
+			// We are only watching one namespace, and its not this one
+			return false
+		}
 		if inject.IgnoredNamespaces.Contains(o.GetName()) {
 			// skip special kubernetes system namespaces
 			return false
@@ -100,8 +114,7 @@ func (nc *NamespaceController) Run(stopCh <-chan struct{}) {
 	}
 	go nc.startCaBundleWatcher(stopCh)
 	nc.queue.Run(stopCh)
-	nc.namespaces.ShutdownHandlers()
-	nc.configmaps.ShutdownHandlers()
+	controllers.ShutdownAll(nc.configmaps, nc.namespaces)
 }
 
 // startCaBundleWatcher listens for updates to the CA bundle and update cm in each namespace

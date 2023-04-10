@@ -87,6 +87,7 @@ import (
 	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
 	istioinformer "istio.io/client-go/pkg/informers/externalversions"
 	"istio.io/istio/operator/pkg/apis"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube/kubetypes"
@@ -410,37 +411,41 @@ func newClientInternal(clientFactory *clientFactory, revision string) (*client, 
 	if err != nil {
 		return nil, err
 	}
-	c.kubeInformer = informers.NewSharedInformerFactory(c.kube, resyncInterval)
+	c.kubeInformer = informers.NewSharedInformerFactoryWithOptions(c.kube, resyncInterval, informers.WithNamespace(features.InformerWatchNamespace))
 
 	c.metadata, err = metadata.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.metadataInformer = metadatainformer.NewSharedInformerFactory(c.metadata, resyncInterval)
+	c.metadataInformer = metadatainformer.NewFilteredSharedInformerFactory(c.metadata, resyncInterval, features.InformerWatchNamespace, nil)
 
 	c.dynamic, err = dynamic.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.dynamicInformer = dynamicinformer.NewDynamicSharedInformerFactory(c.dynamic, resyncInterval)
+	c.dynamicInformer = dynamicinformer.NewFilteredDynamicSharedInformerFactory(c.dynamic, resyncInterval, features.InformerWatchNamespace, nil)
 
 	c.istio, err = istioclient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.istioInformer = istioinformer.NewSharedInformerFactory(c.istio, resyncInterval)
+	c.istioInformer = istioinformer.NewSharedInformerFactoryWithOptions(c.istio, resyncInterval, istioinformer.WithNamespace(features.InformerWatchNamespace))
 
 	c.gatewayapi, err = gatewayapiclient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.gatewayapiInformer = gatewayapiinformer.NewSharedInformerFactory(c.gatewayapi, resyncInterval)
+	c.gatewayapiInformer = gatewayapiinformer.NewSharedInformerFactoryWithOptions(
+		c.gatewayapi,
+		resyncInterval,
+		gatewayapiinformer.WithNamespace(features.InformerWatchNamespace),
+	)
 
 	c.extSet, err = kubeExtClient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.extInformer = kubeExtInformers.NewSharedInformerFactory(c.extSet, resyncInterval)
+	c.extInformer = kubeExtInformers.NewSharedInformerFactoryWithOptions(c.extSet, resyncInterval, kubeExtInformers.WithNamespace(features.InformerWatchNamespace))
 
 	c.portManager = defaultAvailablePort
 
@@ -552,7 +557,7 @@ func (c *client) RunAndWait(stop <-chan struct{}) {
 		fastWaitForCacheSync(stop, c.istioInformer)
 		fastWaitForCacheSync(stop, c.gatewayapiInformer)
 		fastWaitForCacheSync(stop, c.extInformer)
-		_ = wait.PollImmediate(time.Microsecond*100, wait.ForeverTestTimeout, func() (bool, error) {
+		_ = wait.PollUntilContextTimeout(context.Background(), time.Microsecond*100, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
 			select {
 			case <-stop:
 				return false, fmt.Errorf("channel closed")
@@ -634,7 +639,7 @@ type dynamicInformerSync interface {
 func fastWaitForCacheSync(stop <-chan struct{}, informerFactory reflectInformerSync) {
 	returnImmediately := make(chan struct{})
 	close(returnImmediately)
-	_ = wait.PollImmediate(time.Microsecond*100, wait.ForeverTestTimeout, func() (bool, error) {
+	_ = wait.PollUntilContextTimeout(context.Background(), time.Microsecond*100, wait.ForeverTestTimeout, true, func(context.Context) (bool, error) {
 		select {
 		case <-stop:
 			return false, fmt.Errorf("channel closed")
@@ -705,7 +710,7 @@ func (c *client) WaitForCacheSync(stop <-chan struct{}, cacheSyncs ...cache.Info
 func fastWaitForCacheSyncDynamic(stop <-chan struct{}, informerFactory dynamicInformerSync) {
 	returnImmediately := make(chan struct{})
 	close(returnImmediately)
-	_ = wait.PollImmediate(time.Microsecond*100, wait.ForeverTestTimeout, func() (bool, error) {
+	_ = wait.PollUntilContextTimeout(context.Background(), time.Microsecond*100, wait.ForeverTestTimeout, true, func(context.Context) (bool, error) {
 		select {
 		case <-stop:
 			return false, fmt.Errorf("channel closed")
@@ -1089,17 +1094,15 @@ func (c *client) UtilFactory() util.Factory {
 func (c *client) applyYAMLFile(namespace string, dryRun bool, file string) error {
 	// Create the options.
 	streams, _, stdout, stderr := genericclioptions.NewTestIOStreams()
-	flags := apply.NewApplyFlags(c.clientFactory, streams)
+	flags := apply.NewApplyFlags(streams)
 	flags.DeleteFlags.FileNameFlags.Filenames = &[]string{file}
 
 	cmd := apply.NewCmdApply("", c.clientFactory, streams)
-	opts, err := flags.ToOptions(cmd, "", nil)
+	opts, err := flags.ToOptions(c.clientFactory, cmd, "", nil)
 	if err != nil {
 		return err
 	}
 	opts.DynamicClient = c.dynamic
-	opts.DryRunVerifier = resource.NewQueryParamVerifier(c.dynamic, c.clientFactory.OpenAPIGetter(), resource.QueryParamDryRun)
-	opts.FieldValidationVerifier = resource.NewQueryParamVerifier(c.dynamic, c.clientFactory.OpenAPIGetter(), resource.QueryParamFieldValidation)
 	opts.FieldManager = fieldManager
 	if dryRun {
 		opts.DryRunStrategy = util.DryRunServer
@@ -1134,7 +1137,7 @@ func (c *client) applyYAMLFile(namespace string, dryRun bool, file string) error
 
 	opts.OpenAPISchema, _ = c.clientFactory.OpenAPISchema()
 
-	opts.Validator, err = c.clientFactory.Validator(metav1.FieldValidationStrict, opts.FieldValidationVerifier)
+	opts.Validator, err = c.clientFactory.Validator(metav1.FieldValidationStrict)
 	if err != nil {
 		return err
 	}
@@ -1234,7 +1237,6 @@ func (c *client) deleteFile(namespace string, dryRun bool, file string) error {
 	opts.WaitForDeletion = true
 	opts.WarnClusterScope = enforceNamespace
 	opts.DynamicClient = c.dynamic
-	opts.DryRunVerifier = resource.NewQueryParamVerifier(c.dynamic, c.clientFactory.OpenAPIGetter(), resource.QueryParamDryRun)
 
 	if dryRun {
 		opts.DryRunStrategy = util.DryRunServer

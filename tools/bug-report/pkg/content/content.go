@@ -96,7 +96,7 @@ func retMap(filename, text string, err error) (map[string]string, error) {
 // GetK8sResources returns all k8s cluster resources.
 func GetK8sResources(p *Params) (map[string]string, error) {
 	out, err := p.Runner.RunCmd("get --all-namespaces "+
-		"all,namespaces,jobs,ingresses,endpoints,customresourcedefinitions,configmaps,events,"+
+		"all,namespaces,jobs,ingresses,endpoints,endpointslices,customresourcedefinitions,configmaps,events,"+
 		"mutatingwebhookconfigurations,validatingwebhookconfigurations "+
 		"-o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
 	return retMap("k8s-resources", out, err)
@@ -188,6 +188,21 @@ func GetProxyInfo(p *Params) (map[string]string, error) {
 	}
 	ret := make(map[string]string)
 	for _, url := range common.ProxyDebugURLs(p.ClusterVersion) {
+		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun)
+		if err != nil {
+			return nil, err
+		}
+		ret[url] = out
+	}
+	return ret, nil
+}
+
+func GetZtunnelInfo(p *Params) (map[string]string, error) {
+	if p.Namespace == "" || p.Pod == "" {
+		return nil, fmt.Errorf("getZtunnelInfo requires namespace and pod")
+	}
+	ret := make(map[string]string)
+	for _, url := range common.ZtunnelDebugURLs(p.ClusterVersion) {
 		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun)
 		if err != nil {
 			return nil, err

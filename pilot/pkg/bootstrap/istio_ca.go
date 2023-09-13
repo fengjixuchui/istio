@@ -33,8 +33,10 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	securityModel "istio.io/istio/pilot/pkg/security/model"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/jwt"
 	"istio.io/istio/pkg/kube/namespace"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/cmd"
 	"istio.io/istio/security/pkg/pki/ca"
@@ -42,12 +44,9 @@ import (
 	caserver "istio.io/istio/security/pkg/server/ca"
 	"istio.io/istio/security/pkg/server/ca/authenticate"
 	"istio.io/istio/security/pkg/util"
-	"istio.io/pkg/env"
-	"istio.io/pkg/log"
 )
 
 type caOptions struct {
-	// Either extCAK8s or extCAGrpc
 	ExternalCAType   ra.CaExternalType
 	ExternalCASigner string
 	// domain to use in SPIFFE identity URLs
@@ -133,12 +132,11 @@ var (
 
 	// TODO: Likely to be removed and added to mesh config
 	externalCaType = env.Register("EXTERNAL_CA", "",
-		"External CA Integration Type. Permitted Values are ISTIOD_RA_KUBERNETES_API or "+
-			"ISTIOD_RA_ISTIO_API").Get()
+		"External CA Integration Type. Permitted value is ISTIOD_RA_KUBERNETES_API.").Get()
 
 	// TODO: Likely to be removed and added to mesh config
 	k8sSigner = env.Register("K8S_SIGNER", "",
-		"Kubernates CA Signer type. Valid from Kubernates 1.18").Get()
+		"Kubernetes CA Signer type. Valid from Kubernetes 1.18").Get()
 )
 
 // RunCA will start the cert signing GRPC service on an existing server.
@@ -153,7 +151,7 @@ func (s *Server) RunCA(grpc *grpc.Server, ca caserver.CertificateAuthority, opts
 	if err == nil {
 		tok, err := detectAuthEnv(string(token))
 		if err != nil {
-			log.Warn("Starting with invalid K8S JWT token", err, string(token))
+			log.Warnf("Starting with invalid K8S JWT token: %v", err)
 		} else {
 			if iss == "" {
 				iss = tok.Iss
@@ -272,7 +270,7 @@ func (s *Server) loadCACerts(caOpts *caOptions, dir string) error {
 	}
 
 	secret, err := s.kubeClient.Kube().CoreV1().Secrets(caOpts.Namespace).Get(
-		context.TODO(), ca.ExternalCASecret, metav1.GetOptions{})
+		context.TODO(), ca.CACertsSecret, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -315,7 +313,7 @@ func handleEvent(s *Server) {
 	newCABundle, err = os.ReadFile(fileBundle.RootCertFile)
 
 	if err != nil {
-		log.Error("failed reading root-cert.pem: ", err)
+		log.Errorf("failed reading root-cert.pem: %v", err)
 		return
 	}
 
@@ -332,13 +330,13 @@ func handleEvent(s *Server) {
 		fileBundle.RootCertFile)
 
 	if err != nil {
-		log.Error("Failed to update new Plug-in CA certs: ", err)
+		log.Errorf("Failed to update new Plug-in CA certs: %v", err)
 		return
 	}
 
 	err = s.updatePluggedinRootCertAndGenKeyCert()
 	if err != nil {
-		log.Error("Failed generating plugged-in istiod key cert: ", err)
+		log.Errorf("Failed generating plugged-in istiod key cert: %v", err)
 		return
 	}
 
@@ -367,7 +365,7 @@ func (s *Server) handleCACertsFileWatch() {
 
 		case err := <-s.cacertsWatcher.Errors:
 			if err != nil {
-				log.Error("Failed to catch events on cacerts file: ", err)
+				log.Errorf("failed to catch events on cacerts file: %v", err)
 				return
 			}
 
@@ -380,11 +378,11 @@ func (s *Server) handleCACertsFileWatch() {
 func (s *Server) addCACertsFileWatcher(dir string) error {
 	err := s.cacertsWatcher.Add(dir)
 	if err != nil {
-		log.Info("AUTO_RELOAD_PLUGIN_CERTS will not work, failed to add file watcher: ", err)
+		log.Infof("AUTO_RELOAD_PLUGIN_CERTS will not work, failed to add file watcher: %v", err)
 		return err
 	}
 
-	log.Info("Added cacerts files watcher at ", dir)
+	log.Infof("Added cacerts files watcher at %v", dir)
 
 	return nil
 }
@@ -397,7 +395,7 @@ func (s *Server) initCACertsWatcher() {
 
 	s.cacertsWatcher, err = fsnotify.NewWatcher()
 	if err != nil {
-		log.Info("Failed to add CAcerts watcher: ", err)
+		log.Infof("failed to add CAcerts watcher: %v", err)
 		return
 	}
 
@@ -416,6 +414,8 @@ func (s *Server) initCACertsWatcher() {
 //	which may contain multiple roots. A 'cert-chain.pem' file has the full cert chain.
 func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 	var caOpts *ca.IstioCAOptions
+	var detectedSigningCABundle bool
+	var istioGenerated bool
 	var err error
 
 	fileBundle, err := detectSigningCABundle()
@@ -427,35 +427,31 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 		// In Istiod, it is possible to provide one via "cacerts" secret in both cases, for consistency.
 		fileBundle.RootCertFile = ""
 	}
-	if _, err := os.Stat(fileBundle.SigningKeyFile); err != nil {
-		// The user-provided certs are missing - create a self-signed cert.
-		if s.kubeClient != nil {
-			log.Info("Use self-signed certificate as the CA certificate")
-
-			// Abort after 20 minutes.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
-			defer cancel()
-			// rootCertFile will be added to "ca-cert.pem".
-			// readSigningCertOnly set to false - it doesn't seem to be used in Citadel, nor do we have a way
-			// to set it only for one job.
-			caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx,
-				selfSignedRootCertGracePeriodPercentile.Get(), SelfSignedCACertTTL.Get(),
-				selfSignedRootCertCheckInterval.Get(), workloadCertTTL.Get(),
-				maxWorkloadCertTTL.Get(), opts.TrustDomain, true,
-				opts.Namespace, s.kubeClient.Kube().CoreV1(), fileBundle.RootCertFile,
-				enableJitterForRootCertRotator.Get(), caRSAKeySize.Get())
-		} else {
-			log.Warnf(
-				"Use local self-signed CA certificate for testing. Will use in-memory root CA, no K8S access and no ca key file %s",
-				fileBundle.SigningKeyFile)
-
-			caOpts, err = ca.NewSelfSignedDebugIstioCAOptions(fileBundle.RootCertFile, SelfSignedCACertTTL.Get(),
-				workloadCertTTL.Get(), maxWorkloadCertTTL.Get(), opts.TrustDomain, caRSAKeySize.Get())
+	if _, err := os.Stat(fileBundle.SigningKeyFile); err == nil {
+		detectedSigningCABundle = true
+		if _, err := os.Stat(path.Join(LocalCertDir.Get(), ca.IstioGenerated)); err == nil {
+			istioGenerated = true
 		}
+	}
+
+	if !detectedSigningCABundle || (detectedSigningCABundle && istioGenerated) {
+		if detectedSigningCABundle && istioGenerated {
+			log.Infof("%s secret found is IstioGenerated, use it as the CA certificate", ca.CACertsSecret)
+
+			// TODO(jaellio): Currently, istiod handles a "cacerts" secret with the "istio-generated" key the same way
+			// it handles the "istio-ca-secret" secret. Even though "cacerts" is file mounted, istiod will only watch the
+			// secret. If an "istio-ca-secret" exists in the control plane ns, it will be used instead of a "cacerts"
+			// secret with the "istio-generated" key.
+			// This will change in the future, and istiod will watch the file mount instead.
+		}
+
+		// Either the secret is not mounted, or it is mounted but the "istio-generated" key is used.
+		caOpts, err = s.createSelfSignedCACertificateOptions(&fileBundle, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create a self-signed istiod CA: %v", err)
+			return nil, err
 		}
 	} else {
+		// The secret is mounted and the "istio-generated" key is not used.
 		log.Info("Use local CA certificate")
 
 		caOpts, err = ca.NewPluggedCertIstioCAOptions(fileBundle, workloadCertTTL.Get(), maxWorkloadCertTTL.Get(), caRSAKeySize.Get())
@@ -463,9 +459,7 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 			return nil, fmt.Errorf("failed to create an istiod CA: %v", err)
 		}
 
-		if features.AutoReloadPluginCerts {
-			s.initCACertsWatcher()
-		}
+		s.initCACertsWatcher()
 	}
 	istioCA, err := ca.NewIstioCA(caOpts)
 	if err != nil {
@@ -479,6 +473,39 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 	// Start root cert rotator in a separate goroutine.
 	istioCA.Run(s.internalStop)
 	return istioCA, nil
+}
+
+func (s *Server) createSelfSignedCACertificateOptions(fileBundle *ca.SigningCAFileBundle, opts *caOptions) (*ca.IstioCAOptions, error) {
+	var caOpts *ca.IstioCAOptions
+	var err error
+	if s.kubeClient != nil {
+		log.Info("Use self-signed certificate as the CA certificate")
+
+		// Abort after 20 minutes.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
+		defer cancel()
+		// rootCertFile will be added to "ca-cert.pem".
+		// readSigningCertOnly set to false - it doesn't seem to be used in Citadel, nor do we have a way
+		// to set it only for one job.
+		caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx,
+			selfSignedRootCertGracePeriodPercentile.Get(), SelfSignedCACertTTL.Get(),
+			selfSignedRootCertCheckInterval.Get(), workloadCertTTL.Get(),
+			maxWorkloadCertTTL.Get(), opts.TrustDomain, true,
+			opts.Namespace, s.kubeClient.Kube().CoreV1(), fileBundle.RootCertFile,
+			enableJitterForRootCertRotator.Get(), caRSAKeySize.Get())
+	} else {
+		log.Warnf(
+			"Use local self-signed CA certificate for testing. Will use in-memory root CA, no K8S access and no ca key file %s",
+			fileBundle.SigningKeyFile)
+
+		caOpts, err = ca.NewSelfSignedDebugIstioCAOptions(fileBundle.RootCertFile, SelfSignedCACertTTL.Get(),
+			workloadCertTTL.Get(), maxWorkloadCertTTL.Get(), opts.TrustDomain, caRSAKeySize.Get())
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create a self-signed istiod CA: %v", err)
+	}
+
+	return caOpts, nil
 }
 
 // createIstioRA initializes the Istio RA signing functionality.
@@ -538,7 +565,7 @@ func (s *Server) createIstioRA(opts *caOptions) (ra.RegistrationAuthority, error
 
 // getJwtPath returns jwt path.
 func getJwtPath() string {
-	log.Info("JWT policy is ", features.JwtPolicy)
+	log.Infof("JWT policy is %v", features.JwtPolicy)
 	switch features.JwtPolicy {
 	case jwt.PolicyThirdParty:
 		return securityModel.K8sSATrustworthyJwtFileName

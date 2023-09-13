@@ -23,8 +23,10 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/ryanuber/go-glob"
+	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 
 	"istio.io/api/annotation"
 	"istio.io/api/mesh/v1alpha1"
@@ -45,6 +47,8 @@ import (
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -99,9 +103,7 @@ func NewIstiodAnalyzer(analyzer *analysis.CombinedAnalyzer, namespace,
 	}
 
 	// Get the closure of all input collections for our analyzer, paying attention to transforms
-	kubeResources := kuberesource.SkipExcludedCollections(
-		analyzer.Metadata().Inputs,
-		kuberesource.DefaultExcludedResourceKinds())
+	kubeResources := kuberesource.ConvertInputsToSchemas(analyzer.Metadata().Inputs)
 
 	mcfg := mesh.DefaultMeshConfig()
 	sa := &IstiodAnalyzer{
@@ -118,25 +120,41 @@ func NewIstiodAnalyzer(analyzer *analysis.CombinedAnalyzer, namespace,
 	return sa
 }
 
+func (sa *IstiodAnalyzer) ReAnalyzeSubset(kinds sets.Set[config.GroupVersionKind], cancel <-chan struct{}) (AnalysisResult, error) {
+	subset := sa.analyzer.RelevantSubset(kinds)
+	return sa.internalAnalyze(subset, cancel)
+}
+
 // ReAnalyze loads the sources and executes the analysis, assuming init is already called
 func (sa *IstiodAnalyzer) ReAnalyze(cancel <-chan struct{}) (AnalysisResult, error) {
-	var result AnalysisResult
-	store := sa.initializedStore
-	result.ExecutedAnalyzers = sa.analyzer.AnalyzerNames()
-	result.SkippedAnalyzers = sa.analyzer.RemoveSkipped(store.Schemas())
+	return sa.internalAnalyze(sa.analyzer, cancel)
+}
 
-	kubelib.WaitForCacheSync(cancel, store.HasSynced)
+func (sa *IstiodAnalyzer) internalAnalyze(a *analysis.CombinedAnalyzer, cancel <-chan struct{}) (AnalysisResult, error) {
+	var result AnalysisResult
+	result.MappedMessages = map[string]diag.Messages{}
+	store := sa.initializedStore
+	result.ExecutedAnalyzers = a.AnalyzerNames()
+	result.SkippedAnalyzers = a.RemoveSkipped(store.Schemas())
+
+	kubelib.WaitForCacheSync("istiod analyzer", cancel, store.HasSynced)
 
 	ctx := NewContext(store, cancel, sa.collectionReporter)
 
-	sa.analyzer.Analyze(ctx)
+	a.Analyze(ctx)
 
-	namespaces := make(map[resource.Namespace]struct{})
+	// TODO(hzxuzhonghu): we do not need set here
+	namespaces := sets.New[resource.Namespace]()
 	if sa.namespace != "" {
-		namespaces[sa.namespace] = struct{}{}
+		namespaces.Insert(sa.namespace)
 	}
-	// TODO: analysis is run for all namespaces, even if they are requested to be filtered.
-	msgs := filterMessages(ctx.(*istiodContext).messages, namespaces, sa.suppressions)
+	for _, analyzerName := range result.ExecutedAnalyzers {
+
+		// TODO: analysis is run for all namespaces, even if they are requested to be filtered.
+		msgs := filterMessages(ctx.(*istiodContext).GetMessages(analyzerName), namespaces, sa.suppressions)
+		result.MappedMessages[analyzerName] = msgs.SortedDedupedCopy()
+	}
+	msgs := filterMessages(ctx.(*istiodContext).GetMessages(), namespaces, sa.suppressions)
 	result.Messages = msgs.SortedDedupedCopy()
 
 	return result, nil
@@ -224,13 +242,29 @@ func (sa *IstiodAnalyzer) SetSuppressions(suppressions []AnalysisSuppression) {
 	sa.suppressions = suppressions
 }
 
+// AddTestReaderKubeSource adds a yaml source to the analyzer, which will analyze
+// runtime resources like pods and namespaces for use in tests.
+func (sa *IstiodAnalyzer) AddTestReaderKubeSource(readers []ReaderSource) error {
+	return sa.addReaderKubeSourceInternal(readers, true)
+}
+
 // AddReaderKubeSource adds a source based on the specified k8s yaml files to the current IstiodAnalyzer
 func (sa *IstiodAnalyzer) AddReaderKubeSource(readers []ReaderSource) error {
+	return sa.addReaderKubeSourceInternal(readers, false)
+}
+
+func (sa *IstiodAnalyzer) addReaderKubeSourceInternal(readers []ReaderSource, includeRuntimeResources bool) error {
 	var src *file.KubeSource
 	if sa.fileSource != nil {
 		src = sa.fileSource
 	} else {
-		src = file.NewKubeSource(sa.kubeResources)
+		var readerResources collection.Schemas
+		if includeRuntimeResources {
+			readerResources = sa.kubeResources
+		} else {
+			readerResources = sa.kubeResources.Remove(kuberesource.DefaultExcludedSchemas().All()...)
+		}
+		src = file.NewKubeSource(readerResources)
 		sa.fileSource = src
 	}
 	src.SetDefaultNamespace(sa.namespace)
@@ -258,21 +292,63 @@ func (sa *IstiodAnalyzer) AddRunningKubeSource(c kubelib.Client) {
 	sa.AddRunningKubeSourceWithRevision(c, "default")
 }
 
+func isIstioConfigMap(obj any) bool {
+	cObj, ok := obj.(controllers.Object)
+	if !ok {
+		return false
+	}
+	return strings.HasPrefix(cObj.GetName(), "istio")
+}
+
+var secretFieldSelector = fields.AndSelectors(
+	fields.OneTermNotEqualSelector("type", "helm.sh/release.v1"),
+	fields.OneTermNotEqualSelector("type", string(v1.SecretTypeServiceAccountToken))).String()
+
+func (sa *IstiodAnalyzer) GetFiltersByGVK() map[config.GroupVersionKind]kubetypes.Filter {
+	return map[config.GroupVersionKind]kubetypes.Filter{
+		gvk.ConfigMap: {
+			Namespace:    sa.istioNamespace.String(),
+			ObjectFilter: isIstioConfigMap,
+		},
+		gvk.Secret: {
+			FieldSelector: secretFieldSelector,
+		},
+	}
+}
+
 func (sa *IstiodAnalyzer) AddRunningKubeSourceWithRevision(c kubelib.Client, revision string) {
+	// This makes the assumption we don't care about Helm secrets or SA token secrets - two common
+	// large secrets in clusters.
+	// This is a best effort optimization only; the code would behave correctly if we watched all secrets.
+
 	// TODO: are either of these string constants intended to vary?
-	// This gets us only istio/ ones
-	store, err := crdclient.NewForSchemas(c, crdclient.Option{
+	// We gets Istio CRD resources with a specific revision.
+	store := crdclient.NewForSchemas(c, crdclient.Option{
 		Revision:     revision,
 		DomainSuffix: "cluster.local",
 		Identifier:   "analysis-controller",
-	}, sa.kubeResources)
-	// RunAndWait must be called after NewForSchema so that the informers are all created and started.
-	if err != nil {
-		scope.Analysis.Errorf("error adding kube crdclient: %v", err)
-		return
-	}
+		FiltersByGVK: map[config.GroupVersionKind]kubetypes.Filter{
+			gvk.ConfigMap: {
+				Namespace:    sa.istioNamespace.String(),
+				ObjectFilter: isIstioConfigMap,
+			},
+		},
+	}, sa.kubeResources.Remove(kuberesource.DefaultExcludedSchemas().All()...))
 	sa.stores = append(sa.stores, store)
 
+	// We gets service discovery resources without a specific revision.
+	store = crdclient.NewForSchemas(c, crdclient.Option{
+		DomainSuffix: "cluster.local",
+		Identifier:   "analysis-controller",
+		FiltersByGVK: map[config.GroupVersionKind]kubetypes.Filter{
+			gvk.Secret: {
+				FieldSelector: secretFieldSelector,
+			},
+		},
+	}, sa.kubeResources.Intersect(kuberesource.DefaultExcludedSchemas()))
+	sa.stores = append(sa.stores, store)
+
+	// RunAndWait must be called after NewForSchema so that the informers are all created and started.
 	sa.clientsToRun = append(sa.clientsToRun, c)
 
 	// Since we're using a running k8s source, try to get meshconfig and meshnetworks from the configmap.
@@ -344,6 +420,22 @@ func (sa *IstiodAnalyzer) AddDefaultResources() error {
 	return sa.AddReaderKubeSource(readers)
 }
 
+func (sa *IstiodAnalyzer) RegisterEventHandler(kind config.GroupVersionKind, handler model.EventHandler) {
+	for _, store := range sa.stores {
+		store.RegisterEventHandler(kind, handler)
+	}
+}
+
+func (sa *IstiodAnalyzer) Schemas() collection.Schemas {
+	result := collection.NewSchemasBuilder()
+	for _, store := range sa.stores {
+		for _, schema := range store.Schemas().All() {
+			result.MustAdd(schema)
+		}
+	}
+	return result.Build()
+}
+
 func (sa *IstiodAnalyzer) addRunningKubeIstioConfigMapSource(client kubelib.Client) error {
 	meshConfigMap, err := client.Kube().CoreV1().ConfigMaps(string(sa.istioNamespace)).Get(context.TODO(), meshConfigMapName, metav1.GetOptions{})
 	if err != nil {
@@ -380,7 +472,7 @@ func (sa *IstiodAnalyzer) addRunningKubeIstioConfigMapSource(client kubelib.Clie
 type CollectionReporterFn func(config.GroupVersionKind)
 
 // copied from processing/snapshotter/analyzingdistributor.go
-func filterMessages(messages diag.Messages, namespaces map[resource.Namespace]struct{}, suppressions []AnalysisSuppression) diag.Messages {
+func filterMessages(messages diag.Messages, namespaces sets.Set[resource.Namespace], suppressions []AnalysisSuppression) diag.Messages {
 	nsNames := sets.New[string]()
 	for k := range namespaces {
 		nsNames.Insert(k.String())

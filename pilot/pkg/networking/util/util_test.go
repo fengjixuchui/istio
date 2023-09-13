@@ -25,7 +25,6 @@ import (
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
-	xdsutil "github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -40,6 +39,8 @@ import (
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
+	xdsutil "istio.io/istio/pkg/wellknown"
 )
 
 var testCla = &endpoint.ClusterLoadAssignment{
@@ -622,6 +623,145 @@ func TestAddSubsetToMetadata(t *testing.T) {
 			got := v.in
 			if diff := cmp.Diff(got, v.want, protocmp.Transform()); diff != "" {
 				tt.Errorf("AddSubsetToMetadata(%v, %s) produced incorrect result:\ngot: %v\nwant: %v\nDiff: %s", v.in, v.subset, got, v.want, diff)
+			}
+		})
+	}
+}
+
+func TestAddALPNOverrideToMetadata(t *testing.T) {
+	alpnOverrideFalse := &core.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{
+			IstioMetadataKey: {
+				Fields: map[string]*structpb.Value{
+					AlpnOverrideMetadataKey: {
+						Kind: &structpb.Value_StringValue{
+							StringValue: "false",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		name    string
+		tlsMode networking.ClientTLSSettings_TLSmode
+		meta    *core.Metadata
+		want    *core.Metadata
+	}{
+		{
+			name:    "ISTIO_MUTUAL TLS",
+			tlsMode: networking.ClientTLSSettings_ISTIO_MUTUAL,
+			meta:    nil,
+			want:    nil,
+		},
+		{
+			name:    "DISABLED TLS",
+			tlsMode: networking.ClientTLSSettings_DISABLE,
+			meta:    nil,
+			want:    nil,
+		},
+		{
+			name:    "SIMPLE TLS and nil metadata",
+			tlsMode: networking.ClientTLSSettings_SIMPLE,
+			meta:    nil,
+			want:    alpnOverrideFalse,
+		},
+		{
+			name:    "MUTUAL TLS and nil metadata",
+			tlsMode: networking.ClientTLSSettings_SIMPLE,
+			meta:    nil,
+			want:    alpnOverrideFalse,
+		},
+		{
+			name:    "SIMPLE TLS and empty metadata",
+			tlsMode: networking.ClientTLSSettings_SIMPLE,
+			meta: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{},
+			},
+			want: alpnOverrideFalse,
+		},
+		{
+			name:    "SIMPLE TLS and existing istio metadata",
+			tlsMode: networking.ClientTLSSettings_SIMPLE,
+			meta: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					IstioMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							"other-config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "other-config",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					IstioMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							"other-config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "other-config",
+								},
+							},
+							AlpnOverrideMetadataKey: {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "false",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:    "SIMPLE TLS and existing non-istio metadata",
+			tlsMode: networking.ClientTLSSettings_SIMPLE,
+			meta: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					"other-metadata": {
+						Fields: map[string]*structpb.Value{
+							"other-config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "other-config",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					"other-metadata": {
+						Fields: map[string]*structpb.Value{
+							"other-config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "other-config",
+								},
+							},
+						},
+					},
+					IstioMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							AlpnOverrideMetadataKey: {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "false",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, v := range cases {
+		t.Run(v.name, func(tt *testing.T) {
+			got := AddALPNOverrideToMetadata(v.meta, v.tlsMode)
+			if diff := cmp.Diff(got, v.want, protocmp.Transform()); diff != "" {
+				tt.Errorf("AddALPNOverrideToMetadata produced incorrect result:\ngot: %v\nwant: %v\nDiff: %s", got, v.want, diff)
 			}
 		})
 	}
@@ -1228,268 +1368,268 @@ func TestStatefulSessionFilterConfig(t *testing.T) {
 	}
 }
 
-func TestEndpointTLSModeLabel(t *testing.T) {
+func TestMergeTrafficPolicy(t *testing.T) {
 	cases := []struct {
 		name     string
-		endpoint *endpoint.LbEndpoint
-		tlsMode  string
-		want     *endpoint.LbEndpoint
+		original *networking.TrafficPolicy
+		subset   *networking.TrafficPolicy
+		port     *model.Port
+		expected *networking.TrafficPolicy
 	}{
 		{
-			name:     "nil endpoint",
-			endpoint: nil,
-			tlsMode:  "",
-			want:     nil,
+			name:     "all nil policies",
+			original: nil,
+			subset:   nil,
+			port:     nil,
+			expected: nil,
 		},
 		{
-			name:     "endpoint is empty1",
-			tlsMode:  "",
-			endpoint: &endpoint.LbEndpoint{},
-			want:     nil,
+			name: "no subset policy",
+			original: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
+			subset: nil,
+			port:   nil,
+			expected: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
 		},
 		{
-			name:     "endpoint is empty2",
-			tlsMode:  model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{},
-			want:     nil,
+			name:     "no parent policy",
+			original: nil,
+			subset: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
+			port: nil,
+			expected: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
 		},
 		{
-			name:     "endpoint is empty3",
-			tlsMode:  model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{},
-			want:     nil,
+			name: "merge non-conflicting fields",
+			original: &networking.TrafficPolicy{
+				Tls: &networking.ClientTLSSettings{
+					Mode: networking.ClientTLSSettings_ISTIO_MUTUAL,
+				},
+			},
+			subset: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
+			port: nil,
+			expected: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				Tls: &networking.ClientTLSSettings{
+					Mode: networking.ClientTLSSettings_ISTIO_MUTUAL,
+				},
+			},
 		},
-
 		{
-			name:    "endpoint metadata have tunnel,case1 ",
-			tlsMode: model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TunnelLabelShortName: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.TunnelHTTP,
-									},
-								},
+			name: "subset overwrite top-level fields",
+			original: &networking.TrafficPolicy{
+				Tls: &networking.ClientTLSSettings{
+					Mode: networking.ClientTLSSettings_ISTIO_MUTUAL,
+				},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
+			subset: &networking.TrafficPolicy{
+				Tls: &networking.ClientTLSSettings{
+					Mode: networking.ClientTLSSettings_SIMPLE,
+				},
+			},
+			port: nil,
+			expected: &networking.TrafficPolicy{
+				Tls: &networking.ClientTLSSettings{
+					Mode: networking.ClientTLSSettings_SIMPLE,
+				},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+			},
+		},
+		{
+			name:     "merge port level policy, and do not inherit top-level fields",
+			original: nil,
+			subset: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
+				},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+					{
+						Port: &networking.PortSelector{
+							Number: 8080,
+						},
+						LoadBalancer: &networking.LoadBalancerSettings{
+							LbPolicy: &networking.LoadBalancerSettings_Simple{
+								Simple: networking.LoadBalancerSettings_LEAST_REQUEST,
 							},
 						},
 					},
 				},
 			},
-			want: nil,
-		},
-
-		{
-			name:    "endpoint metadata have tunnel,case2 ",
-			tlsMode: model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TunnelLabelShortName: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.TunnelHTTP,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			want: nil,
-		},
-
-		{
-			name:    "endpoint tlsMode ==  tlsMode,case1  ",
-			tlsMode: model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.DisabledTLSModeLabel,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			want: nil,
-		},
-
-		{
-			name:    "endpoint tlsMode ==  tlsMode,case2  ",
-			tlsMode: model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.IstioMutualTLSModeLabel,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			want: nil,
-		},
-
-		{
-			name:    "endpoint tlsMode !=  tlsMode,case1  ",
-			tlsMode: model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.DisabledTLSModeLabel,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			want: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.IstioMutualTLSModeLabel,
-									},
-								},
-							},
-						},
+			port: &model.Port{Port: 8080},
+			expected: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_LEAST_REQUEST,
 					},
 				},
 			},
 		},
-
 		{
-			name:    "endpoint tlsMode !=  tlsMode,case1.1  ",
-			tlsMode: model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				// endpoint tlsMode is not defined
-				Metadata: &core.Metadata{},
-			},
-			want: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.IstioMutualTLSModeLabel,
-									},
-								},
-							},
+			name: "merge port level policy, and do not inherit top-level fields",
+			original: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
+				},
+				OutlierDetection: &networking.OutlierDetection{
+					ConsecutiveErrors: 20,
+				},
+				PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+					{
+						Port: &networking.PortSelector{
+							Number: 8080,
+						},
+						OutlierDetection: &networking.OutlierDetection{
+							ConsecutiveErrors: 15,
 						},
 					},
 				},
 			},
-		},
-
-		{
-			name:    "endpoint tlsMode !=  tlsMode,case1.2  ",
-			tlsMode: model.IstioMutualTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{},
+			subset: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
 				},
-			},
-			want: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.IstioMutualTLSModeLabel,
-									},
-								},
-							},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+					{
+						Port: &networking.PortSelector{
+							Number: 8080,
+						},
+						OutlierDetection: &networking.OutlierDetection{
+							ConsecutiveErrors: 13,
 						},
 					},
 				},
 			},
-		},
-
-		{
-			name:    "endpoint tlsMode !=  tlsMode,case 2  ",
-			tlsMode: model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					// endpoint tlsMode is not defined
-					FilterMetadata: map[string]*structpb.Struct{},
+			port: &model.Port{Port: 8080},
+			expected: &networking.TrafficPolicy{
+				OutlierDetection: &networking.OutlierDetection{
+					ConsecutiveErrors: 13,
 				},
 			},
-			want: nil,
 		},
-
 		{
-			name:    "endpoint tlsMode !=  tlsMode,case 2.1  ",
-			tlsMode: model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				// endpoint tlsMode is not defined
-				Metadata: &core.Metadata{},
-			},
-			want: nil,
-		},
-
-		{
-			name:    "endpoint tlsMode !=  tlsMode,case 2.2  ",
-			tlsMode: model.DisabledTLSModeLabel,
-			endpoint: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{
-						EnvoyTransportSocketMetadataKey: {
-							Fields: map[string]*structpb.Value{
-								model.TLSModeLabelShortname: {
-									Kind: &structpb.Value_StringValue{
-										StringValue: model.IstioMutualTLSModeLabel,
-									},
-								},
-							},
+			name: "default cluster, non-matching port selector",
+			original: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
+				},
+				OutlierDetection: &networking.OutlierDetection{
+					ConsecutiveErrors: 20,
+				},
+				PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+					{
+						Port: &networking.PortSelector{
+							Number: 8080,
+						},
+						OutlierDetection: &networking.OutlierDetection{
+							ConsecutiveErrors: 15,
 						},
 					},
 				},
 			},
-			want: &endpoint.LbEndpoint{
-				Metadata: &core.Metadata{
-					FilterMetadata: map[string]*structpb.Struct{},
+			subset: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
+				},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+					{
+						Port: &networking.PortSelector{
+							Number: 8080,
+						},
+						OutlierDetection: &networking.OutlierDetection{
+							ConsecutiveErrors: 13,
+						},
+					},
+				},
+			},
+			port: &model.Port{Port: 9090},
+			expected: &networking.TrafficPolicy{
+				LoadBalancer: &networking.LoadBalancerSettings{
+					LbPolicy: &networking.LoadBalancerSettings_Simple{
+						Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+					},
+				},
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				OutlierDetection: &networking.OutlierDetection{
+					ConsecutiveErrors: 20,
 				},
 			},
 		},
 	}
+
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			newEp, _ := MaybeApplyTLSModeLabel(tt.endpoint, tt.tlsMode)
-
-			if newEp == nil || tt.want == nil {
-				if tt.want == newEp {
-					return
-				}
-				t.Errorf("test case[%s] error, Unexpected Endpoint metadata got %v, want %v", tt.name, newEp, tt.want)
-				return
-			}
-
-			if !reflect.DeepEqual(newEp.Metadata, tt.want.Metadata) {
-				t.Errorf("test case[%s] error, Unexpected Endpoint metadata got %v, want %v", tt.name, newEp, tt.want)
-			}
+			policy := MergeTrafficPolicy(tt.original, tt.subset, tt.port)
+			assert.Equal(t, policy, tt.expected)
 		})
 	}
 }

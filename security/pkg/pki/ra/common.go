@@ -17,10 +17,10 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/exp/slices"
 	clientset "k8s.io/client-go/kubernetes"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pkg/slices"
 	raerror "istio.io/istio/security/pkg/pki/error"
 	"istio.io/istio/security/pkg/pki/util"
 	caserver "istio.io/istio/security/pkg/server/ca"
@@ -63,9 +63,6 @@ type IstioRAOptions struct {
 const (
 	// ExtCAK8s : Integrate with external CA using k8s CSR API
 	ExtCAK8s CaExternalType = "ISTIOD_RA_KUBERNETES_API"
-
-	// ExtCAGrpc : Integration with external CA using Istio CA gRPC API
-	ExtCAGrpc CaExternalType = "ISTIOD_RA_ISTIO_API"
 
 	// DefaultExtCACertDir : Location of external CA certificate
 	DefaultExtCACertDir string = "./etc/external-ca-cert"

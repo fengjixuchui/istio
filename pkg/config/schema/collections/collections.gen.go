@@ -12,6 +12,7 @@ import (
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
 	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
+	k8sioapicoordinationv1 "k8s.io/api/coordination/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
@@ -290,6 +291,21 @@ var (
 		ValidateProto: validation.ValidateKubernetesGateway,
 	}.MustBuild()
 
+	Lease = resource.Builder{
+		Identifier:    "Lease",
+		Group:         "coordination.k8s.io",
+		Kind:          "Lease",
+		Plural:        "leases",
+		Version:       "v1",
+		Proto:         "k8s.io.api.coordination.v1.LeaseSpec",
+		ReflectType:   reflect.TypeOf(&k8sioapicoordinationv1.LeaseSpec{}).Elem(),
+		ProtoPackage:  "k8s.io/api/coordination/v1",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       true,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
 	MeshConfig = resource.Builder{
 		Identifier:    "MeshConfig",
 		Group:         "",
@@ -411,14 +427,17 @@ var (
 	}.MustBuild()
 
 	ReferenceGrant = resource.Builder{
-		Identifier:    "ReferenceGrant",
-		Group:         "gateway.networking.k8s.io",
-		Kind:          "ReferenceGrant",
-		Plural:        "referencegrants",
-		Version:       "v1alpha2",
+		Identifier: "ReferenceGrant",
+		Group:      "gateway.networking.k8s.io",
+		Kind:       "ReferenceGrant",
+		Plural:     "referencegrants",
+		Version:    "v1beta1",
+		VersionAliases: []string{
+			"v1alpha2",
+		},
 		Proto:         "k8s.io.gateway_api.api.v1alpha1.ReferenceGrantSpec",
-		ReflectType:   reflect.TypeOf(&sigsk8siogatewayapiapisv1alpha2.ReferenceGrantSpec{}).Elem(),
-		ProtoPackage:  "sigs.k8s.io/gateway-api/apis/v1alpha2",
+		ReflectType:   reflect.TypeOf(&sigsk8siogatewayapiapisv1beta1.ReferenceGrantSpec{}).Elem(),
+		ProtoPackage:  "sigs.k8s.io/gateway-api/apis/v1beta1",
 		ClusterScoped: false,
 		Synthetic:     false,
 		Builtin:       false,
@@ -686,6 +705,7 @@ var (
 		MustAdd(Ingress).
 		MustAdd(IngressClass).
 		MustAdd(KubernetesGateway).
+		MustAdd(Lease).
 		MustAdd(MeshConfig).
 		MustAdd(MeshNetworks).
 		MustAdd(MutatingWebhookConfiguration).
@@ -726,6 +746,7 @@ var (
 		MustAdd(Ingress).
 		MustAdd(IngressClass).
 		MustAdd(KubernetesGateway).
+		MustAdd(Lease).
 		MustAdd(MutatingWebhookConfiguration).
 		MustAdd(Namespace).
 		MustAdd(Node).
@@ -758,8 +779,8 @@ var (
 		MustAdd(WorkloadGroup).
 		Build()
 
-	// PilotGatewayAPI contains only collections used by Pilot, including experimental Service Api.
-	PilotGatewayAPI = collection.NewSchemasBuilder().
+	// pilotGatewayAPI contains only collections used by Pilot, including the full Gateway API.
+	pilotGatewayAPI = collection.NewSchemasBuilder().
 			MustAdd(AuthorizationPolicy).
 			MustAdd(DestinationRule).
 			MustAdd(EnvoyFilter).
@@ -783,4 +804,26 @@ var (
 			MustAdd(WorkloadEntry).
 			MustAdd(WorkloadGroup).
 			Build()
+
+	// PilotStableGatewayAPI contains only collections used by Pilot, including beta+ Gateway API.
+	pilotStableGatewayAPI = collection.NewSchemasBuilder().
+				MustAdd(AuthorizationPolicy).
+				MustAdd(DestinationRule).
+				MustAdd(EnvoyFilter).
+				MustAdd(Gateway).
+				MustAdd(GatewayClass).
+				MustAdd(HTTPRoute).
+				MustAdd(KubernetesGateway).
+				MustAdd(PeerAuthentication).
+				MustAdd(ProxyConfig).
+				MustAdd(ReferenceGrant).
+				MustAdd(RequestAuthentication).
+				MustAdd(ServiceEntry).
+				MustAdd(Sidecar).
+				MustAdd(Telemetry).
+				MustAdd(VirtualService).
+				MustAdd(WasmPlugin).
+				MustAdd(WorkloadEntry).
+				MustAdd(WorkloadGroup).
+				Build()
 )

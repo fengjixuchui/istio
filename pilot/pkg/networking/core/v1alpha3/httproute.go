@@ -23,13 +23,17 @@ import (
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	anypb "github.com/golang/protobuf/ptypes/any"
 	"google.golang.org/protobuf/types/known/durationpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/envoyfilter"
 	istio_route "istio.io/istio/pilot/pkg/networking/core/v1alpha3/route"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
@@ -41,6 +45,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/proto"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -110,11 +115,11 @@ func (configgen *ConfigGeneratorImpl) BuildHTTPRoutes(
 // buildSidecarInboundHTTPRouteConfig builds the route config with a single wildcard virtual host on the inbound path
 // TODO: trace decorators, inbound timeouts
 func buildSidecarInboundHTTPRouteConfig(lb *ListenerBuilder, cc inboundChainConfig) *route.RouteConfiguration {
-	traceOperation := telemetry.TraceOperation(string(cc.telemetryMetadata.InstanceHostname), int(cc.port.Port))
+	traceOperation := telemetry.TraceOperation(string(cc.telemetryMetadata.InstanceHostname), cc.port.Port)
 	defaultRoute := istio_route.BuildDefaultHTTPInboundRoute(cc.clusterName, traceOperation)
 
 	inboundVHost := &route.VirtualHost{
-		Name:    inboundVirtualHostPrefix + strconv.Itoa(int(cc.port.Port)), // Format: "inbound|http|%d"
+		Name:    inboundVirtualHostPrefix + strconv.Itoa(cc.port.Port), // Format: "inbound|http|%d"
 		Domains: []string{"*"},
 		Routes:  []*route.Route{defaultRoute},
 	}
@@ -143,8 +148,7 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 	listenerPort := 0
 	useSniffing := false
 	var err error
-	if features.EnableProtocolSniffingForOutbound &&
-		!strings.HasPrefix(routeName, model.UnixAddressPrefix) {
+	if !strings.HasPrefix(routeName, model.UnixAddressPrefix) {
 		index := strings.IndexRune(routeName, ':')
 		if index != -1 {
 			useSniffing = true
@@ -200,7 +204,8 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 	util.SortVirtualHosts(virtualHosts)
 
 	if !useSniffing {
-		virtualHosts = append(virtualHosts, buildCatchAllVirtualHost(node))
+		includeRequestAttemptCount := GetProxyHeaders(node, req.Push, istionetworking.ListenerClassSidecarOutbound).IncludeRequestAttemptCount
+		virtualHosts = append(virtualHosts, buildCatchAllVirtualHost(node, includeRequestAttemptCount))
 	}
 
 	out := &route.RouteConfiguration{
@@ -208,9 +213,7 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 		VirtualHosts:                   virtualHosts,
 		ValidateClusters:               proto.BoolFalse,
 		MaxDirectResponseBodySizeBytes: istio_route.DefaultMaxDirectResponseBodySizeBytes,
-	}
-	if features.SidecarIgnorePort {
-		out.IgnorePortInHostMatching = true
+		IgnorePortInHostMatching:       true,
 	}
 
 	// apply envoy filter patches
@@ -292,6 +295,66 @@ func selectVirtualServices(virtualServices []config.Config, servicesByName map[h
 	return out
 }
 
+type ProxyHeaders struct {
+	ServerName                 string
+	ServerHeaderTransformation hcm.HttpConnectionManager_ServerHeaderTransformation
+	ForwardedClientCert        hcm.HttpConnectionManager_ForwardClientCertDetails
+	IncludeRequestAttemptCount bool
+	GenerateRequestID          *wrappers.BoolValue
+	SuppressDebugHeaders       bool
+	SkipIstioMXHeaders         bool
+}
+
+func GetProxyHeaders(node *model.Proxy, push *model.PushContext, class istionetworking.ListenerClass) ProxyHeaders {
+	pc := node.Metadata.ProxyConfigOrDefault(push.Mesh.DefaultConfig)
+	return GetProxyHeadersFromProxyConfig(pc, class)
+}
+
+func GetProxyHeadersFromProxyConfig(pc *meshconfig.ProxyConfig, class istionetworking.ListenerClass) ProxyHeaders {
+	base := ProxyHeaders{
+		ServerName:                 EnvoyServerName,
+		ServerHeaderTransformation: hcm.HttpConnectionManager_OVERWRITE,
+		ForwardedClientCert:        hcm.HttpConnectionManager_APPEND_FORWARD,
+		IncludeRequestAttemptCount: true,
+		SuppressDebugHeaders:       false,
+		GenerateRequestID:          nil, // Envoy default is to enable them, so set nil
+		SkipIstioMXHeaders:         false,
+	}
+	if class == istionetworking.ListenerClassSidecarOutbound {
+		// Likely due to a mistake, outbound uses "envoy" while inbound uses "istio-envoy". Bummer.
+		// We keep it for backwards compatibility.
+		base.ServerName = "" // Envoy default is "envoy" so no need to set it explicitly.
+	}
+	ph := pc.GetProxyHeaders()
+	if ph == nil {
+		return base
+	}
+	if ph.AttemptCount.GetDisabled().GetValue() {
+		base.IncludeRequestAttemptCount = false
+	}
+	if ph.ForwardedClientCert != meshconfig.ForwardClientCertDetails_UNDEFINED {
+		base.ForwardedClientCert = util.MeshConfigToEnvoyForwardClientCertDetails(ph.ForwardedClientCert)
+	}
+	if ph.Server != nil {
+		if ph.Server.Disabled.GetValue() {
+			base.ServerName = ""
+			base.ServerHeaderTransformation = hcm.HttpConnectionManager_PASS_THROUGH
+		} else if ph.Server.Value != "" {
+			base.ServerName = ph.Server.Value
+		}
+	}
+	if ph.RequestId.GetDisabled().GetValue() {
+		base.GenerateRequestID = proto.BoolFalse
+	}
+	if ph.EnvoyDebugHeaders.GetDisabled().GetValue() {
+		base.SuppressDebugHeaders = true
+	}
+	if ph.MetadataExchangeHeaders != nil && ph.MetadataExchangeHeaders.GetMode() == meshconfig.ProxyConfig_ProxyHeaders_IN_MESH {
+		base.SkipIstioMXHeaders = true
+	}
+	return base
+}
+
 func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext,
 	routeName string,
 	listenerPort int,
@@ -325,6 +388,8 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 		listenerPort = 0
 	}
 
+	includeRequestAttemptCount := GetProxyHeaders(node, push, istionetworking.ListenerClassSidecarOutbound).IncludeRequestAttemptCount
+
 	servicesByName := make(map[host.Name]*model.Service)
 	for _, svc := range services {
 		if listenerPort == 0 {
@@ -343,6 +408,10 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 					ServiceRegistry: svc.Attributes.ServiceRegistry,
 					Labels:          svc.Attributes.Labels,
 				},
+			}
+			if features.EnableDualStack {
+				// cannot correctly build virtualHost domains for dual stack without ClusterVIPs
+				servicesByName[svc.Hostname].ClusterVIPs = *svc.ClusterVIPs.DeepCopy()
 			}
 		}
 	}
@@ -447,7 +516,7 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 				Name:                       name,
 				Domains:                    domains,
 				Routes:                     vhwrapper.Routes,
-				IncludeRequestAttemptCount: true,
+				IncludeRequestAttemptCount: includeRequestAttemptCount,
 				TypedPerFilterConfig:       perRouteFilters,
 			}
 		}
@@ -497,7 +566,7 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 func dedupeDomains(domains []string, vhdomains sets.String, expandedHosts []string, knownFQDNs sets.String) []string {
 	temp := domains[:0]
 	for _, d := range domains {
-		if vhdomains.Contains(d) {
+		if vhdomains.Contains(strings.ToLower(d)) {
 			continue
 		}
 		// Check if the domain is an "expanded" host, and its also a known FQDN
@@ -505,11 +574,11 @@ func dedupeDomains(domains []string, vhdomains sets.String, expandedHosts []stri
 		// the real "foo.com"
 		// This works by providing a list of domains that were added as expanding the DNS domain as part of expandedHosts,
 		// and a list of known unexpanded FQDNs to compare against
-		if util.ListContains(expandedHosts, d) && knownFQDNs.Contains(d) { // O(n) search, but n is at most 10
+		if slices.Contains(expandedHosts, d) && knownFQDNs.Contains(d) { // O(n) search, but n is at most 10
 			continue
 		}
 		temp = append(temp, d)
-		vhdomains.Insert(d)
+		vhdomains.Insert(strings.ToLower(d))
 	}
 	return temp
 }
@@ -543,7 +612,7 @@ func getVirtualHostsForSniffedServicePort(vhosts []*route.VirtualHost, routeName
 }
 
 func SidecarIgnorePort(node *model.Proxy) bool {
-	return !node.IsProxylessGrpc() && features.SidecarIgnorePort
+	return !node.IsProxylessGrpc()
 }
 
 // generateVirtualHostDomains generates the set of domain matches for a service being accessed from
@@ -569,6 +638,14 @@ func generateVirtualHostDomains(service *model.Service, listenerPort int, port i
 	if len(svcAddr) > 0 && svcAddr != constants.UnspecifiedIP {
 		domains = appendDomainPort(domains, svcAddr, port)
 	}
+
+	// handle dual stack's extra address when generating the virtualHost domains
+	// assumes that conversion is stripping out the DefaultAddress from ClusterVIPs
+	extraAddr := service.GetExtraAddressesForProxy(node)
+	for _, addr := range extraAddr {
+		domains = appendDomainPort(domains, addr, port)
+	}
+
 	return domains, altHosts
 }
 
@@ -706,14 +783,6 @@ func mergeAllVirtualHosts(vHostPortMap map[int][]*route.VirtualHost) []*route.Vi
 	return virtualHosts
 }
 
-// reverseArray returns its argument string array reversed
-func reverseArray(r []string) []string {
-	for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
-		r[i], r[j] = r[j], r[i]
-	}
-	return r
-}
-
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -739,8 +808,8 @@ func getUniqueAndSharedDNSDomain(fqdnHostname, proxyDomain string) (partsUnique 
 	//       ns2.svc.cluster.local -> local,cluster,svc,ns2
 	partsFQDN := strings.Split(fqdnHostname, ".")
 	partsProxyDomain := strings.Split(proxyDomain, ".")
-	partsFQDNInReverse := reverseArray(partsFQDN)
-	partsProxyDomainInReverse := reverseArray(partsProxyDomain)
+	partsFQDNInReverse := slices.Reverse(partsFQDN)
+	partsProxyDomainInReverse := slices.Reverse(partsProxyDomain)
 	var sharedSuffixesInReverse []string // pieces shared between proxy and svc. e.g., local,cluster,svc
 
 	for i := 0; i < min(len(partsFQDNInReverse), len(partsProxyDomainInReverse)); i++ {
@@ -755,13 +824,13 @@ func getUniqueAndSharedDNSDomain(fqdnHostname, proxyDomain string) (partsUnique 
 		partsUnique = partsFQDN
 	} else {
 		// get the non shared pieces (ns1, foo) and reverse Array
-		partsUnique = reverseArray(partsFQDNInReverse[len(sharedSuffixesInReverse):])
-		partsShared = reverseArray(sharedSuffixesInReverse)
+		partsUnique = slices.Reverse(partsFQDNInReverse[len(sharedSuffixesInReverse):])
+		partsShared = slices.Reverse(sharedSuffixesInReverse)
 	}
 	return
 }
 
-func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
+func buildCatchAllVirtualHost(node *model.Proxy, includeRequestAttemptCount bool) *route.VirtualHost {
 	if util.IsAllowAnyOutbound(node) {
 		egressCluster := util.PassthroughCluster
 		notimeout := durationpb.New(0)
@@ -797,7 +866,7 @@ func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 					},
 				},
 			},
-			IncludeRequestAttemptCount: true,
+			IncludeRequestAttemptCount: includeRequestAttemptCount,
 		}
 	}
 
@@ -817,7 +886,7 @@ func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 				},
 			},
 		},
-		IncludeRequestAttemptCount: true,
+		IncludeRequestAttemptCount: includeRequestAttemptCount,
 	}
 }
 

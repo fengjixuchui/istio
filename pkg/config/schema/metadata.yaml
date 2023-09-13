@@ -152,6 +152,14 @@ resources:
     proto: "k8s.io.api.networking.v1.IngressClassSpec"
     protoPackage: "k8s.io/api/networking/v1"
 
+  - kind: "Lease"
+    plural: "leases"
+    group: "coordination.k8s.io"
+    version: "v1"
+    builtin: true
+    proto: "k8s.io.api.coordination.v1.LeaseSpec"
+    protoPackage: "k8s.io/api/coordination/v1"
+
   - kind: "GatewayClass"
     plural: "gatewayclasses"
     group: "gateway.networking.k8s.io"
@@ -227,8 +235,10 @@ resources:
   - kind: "ReferenceGrant"
     plural: "referencegrants"
     group: "gateway.networking.k8s.io"
-    version: "v1alpha2"
-    protoPackage: "sigs.k8s.io/gateway-api/apis/v1alpha2"
+    version: "v1beta1"
+    versionAliases:
+    - "v1alpha2"
+    protoPackage: "sigs.k8s.io/gateway-api/apis/v1beta1"
     proto: "k8s.io.gateway_api.api.v1alpha1.ReferenceGrantSpec"
 
   ## Istio resources

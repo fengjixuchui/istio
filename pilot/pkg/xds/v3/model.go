@@ -36,6 +36,7 @@ const (
 	// DebugType requests debug info from istio, a secured implementation for istio debug interface.
 	DebugType                 = "istio.io/debug"
 	BootstrapType             = resource.APITypePrefix + "envoy.config.bootstrap.v3.Bootstrap"
+	AddressType               = resource.APITypePrefix + "istio.workload.Address"
 	WorkloadType              = resource.APITypePrefix + "istio.workload.Workload"
 	WorkloadAuthorizationType = resource.APITypePrefix + "istio.security.Authorization"
 
@@ -62,7 +63,7 @@ func GetShortType(typeURL string) string {
 		return "PCDS"
 	case ExtensionConfigurationType:
 		return "ECDS"
-	case WorkloadType:
+	case AddressType, WorkloadType:
 		return "WDS"
 	case WorkloadAuthorizationType:
 		return "WADS"
@@ -92,7 +93,7 @@ func GetMetricType(typeURL string) string {
 		return "ecds"
 	case BootstrapType:
 		return "bds"
-	case WorkloadType:
+	case AddressType, WorkloadType:
 		return "wds"
 	case WorkloadAuthorizationType:
 		return "wads"
@@ -122,7 +123,7 @@ func GetResourceType(shortType string) string {
 	case "ECDS":
 		return ExtensionConfigurationType
 	case "WDS":
-		return WorkloadType
+		return AddressType
 	case "WADS":
 		return WorkloadAuthorizationType
 	default:

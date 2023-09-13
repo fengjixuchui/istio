@@ -31,7 +31,6 @@ import (
 	"k8s.io/client-go/rest"
 	cache2 "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -42,6 +41,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"istio.io/api/operator/v1alpha1"
+	revtag "istio.io/istio/istioctl/pkg/tag"
 	"istio.io/istio/operator/pkg/apis/istio"
 	iopv1alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/cache"
@@ -55,12 +55,13 @@ import (
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/operator/pkg/util/progress"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/errdict"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/url"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/pkg/log"
-	"istio.io/pkg/version"
+	"istio.io/istio/pkg/version"
 )
 
 const (
@@ -72,7 +73,7 @@ const (
 )
 
 var (
-	scope      = log.RegisterScope("installer", "installer", 0)
+	scope      = log.RegisterScope("installer", "installer")
 	restConfig *rest.Config
 )
 
@@ -97,7 +98,6 @@ func watchedResources(version *kubeversion.Info) []schema.GroupVersionKind {
 		// Endpoints should not be pruned because these are generated and not in the manifest.
 		// {Group: "", Version: "v1", Kind: name.EndpointStr},
 		{Group: "", Version: "v1", Kind: name.CMStr},
-		{Group: "", Version: "v1", Kind: name.PVCStr},
 		{Group: "", Version: "v1", Kind: name.PodStr},
 		{Group: "", Version: "v1", Kind: name.SecretStr},
 		{Group: "", Version: "v1", Kind: name.SAStr},
@@ -177,12 +177,12 @@ var (
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldIOP, ok := e.ObjectOld.(*iopv1alpha1.IstioOperator)
 			if !ok {
-				scope.Error(errdict.OperatorFailedToGetObjectInCallback, "failed to get old IstioOperator")
+				errdict.OperatorFailedToGetObjectInCallback.Log(scope).Errorf("failed to get old IstioOperator")
 				return false
 			}
 			newIOP, ok := e.ObjectNew.(*iopv1alpha1.IstioOperator)
 			if !ok {
-				scope.Error(errdict.OperatorFailedToGetObjectInCallback, "failed to get new IstioOperator")
+				errdict.OperatorFailedToGetObjectInCallback.Log(scope).Errorf("failed to get new IstioOperator")
 				return false
 			}
 
@@ -216,15 +216,6 @@ var (
 		},
 	}
 )
-
-// NewReconcileIstioOperator creates a new ReconcileIstioOperator and returns a ptr to it.
-func NewReconcileIstioOperator(client client.Client, kubeClient kube.Client, scheme *runtime.Scheme) *ReconcileIstioOperator {
-	return &ReconcileIstioOperator{
-		client:     client,
-		kubeClient: kubeClient,
-		scheme:     scheme,
-	}
-}
 
 // ReconcileIstioOperator reconciles a IstioOperator object
 type ReconcileIstioOperator struct {
@@ -260,7 +251,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
-		scope.Warnf(errdict.OperatorFailedToGetObjectFromAPIServer, "error getting IstioOperator %s: %s", iopName, err)
+		errdict.OperatorFailedToGetObjectFromAPIServer.Log(scope).Warnf("error getting IstioOperator %s: %s", iopName, err)
 		metrics.CountCRFetchFail(errors.ReasonForError(err))
 		return reconcile.Result{}, err
 	}
@@ -278,6 +269,10 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 			return reconcile.Result{}, nil
 		}
 	}
+	if iop.Spec.Profile == "ambient" {
+		scope.Infof("Ignoring the IstioOperator CR %s because it is using the unsupported profile 'ambient'.", iopName)
+		return reconcile.Result{}, nil
+	}
 
 	var err error
 	iopMerged := &iopv1alpha1.IstioOperator{}
@@ -285,7 +280,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 	// get the merged values in iop on top of the defaults for the profile given by iop.profile
 	iopMerged.Spec, err = mergeIOPSWithProfile(iopMerged)
 	if err != nil {
-		scope.Errorf(errdict.OperatorFailedToMergeUserIOP, "failed to merge base profile with user IstioOperator CR %s, %s", iopName, err)
+		errdict.OperatorFailedToMergeUserIOP.Log(scope).Errorf("failed to merge base profile with user IstioOperator CR %s, %s", iopName, err)
 		return reconcile.Result{}, err
 	}
 
@@ -328,7 +323,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 				scope.Infof("Could not remove finalizer from %s due to conflict. Operation will be retried in next reconcile attempt.", iopName)
 				return reconcile.Result{}, nil
 			}
-			scope.Errorf(errdict.OperatorFailedToRemoveFinalizer, "error removing finalizer: %s", finalizerError)
+			errdict.OperatorFailedToRemoveFinalizer.Log(scope).Errorf("error removing finalizer: %s", finalizerError)
 			return reconcile.Result{}, finalizerError
 		}
 		return reconcile.Result{}, nil
@@ -345,7 +340,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 			} else if errors.IsConflict(err) {
 				scope.Infof("Could not add finalizer to %s due to conflict. Operation will be retried in next reconcile attempt.", iopName)
 			}
-			scope.Errorf(errdict.OperatorFailedToAddFinalizer, "Failed to add finalizer to IstioOperator CR %s: %s", iopName, err)
+			errdict.OperatorFailedToAddFinalizer.Log(scope).Errorf("Failed to add finalizer to IstioOperator CR %s: %s", iopName, err)
 			return reconcile.Result{}, err
 		}
 	}
@@ -371,7 +366,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 	}
 	err = util.ValidateIOPCAConfig(r.kubeClient, iopMerged)
 	if err != nil {
-		scope.Errorf(errdict.OperatorFailedToConfigure, "failed to apply IstioOperator resources. Error %s", err)
+		errdict.OperatorFailedToConfigure.Log(scope).Errorf("failed to apply IstioOperator resources. Error %s", err)
 		return reconcile.Result{}, err
 	}
 	helmReconcilerOptions := &helmreconciler.Options{
@@ -381,6 +376,7 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 	if r.options != nil {
 		helmReconcilerOptions.Force = r.options.Force
 	}
+	exists := revtag.PreviousInstallExists(context.Background(), r.kubeClient.Kube())
 	reconciler, err := helmreconciler.NewHelmReconciler(r.client, r.kubeClient, iopMerged, helmReconcilerOptions)
 	if err != nil {
 		scope.Errorf("Error during reconcile. Error: %s", err)
@@ -394,12 +390,34 @@ func (r *ReconcileIstioOperator) Reconcile(_ context.Context, request reconcile.
 	if err != nil {
 		scope.Errorf("Error during reconcile: %s", err)
 	}
+	if err = processDefaultWebhookAfterReconcile(iopMerged, r.kubeClient, exists); err != nil {
+		scope.Errorf("Error during reconcile: %s", err)
+		return reconcile.Result{}, err
+	}
+
 	if err := reconciler.SetStatusComplete(status); err != nil {
 		scope.Errorf("Error during reconcile, failed to update status to Complete. Error: %s", err)
 		return reconcile.Result{}, err
 	}
 
 	return reconcile.Result{}, err
+}
+
+func processDefaultWebhookAfterReconcile(iop *iopv1alpha1.IstioOperator, client kube.Client, exists bool) error {
+	var ns string
+	if configuredNamespace := iopv1alpha1.Namespace(iop.Spec); configuredNamespace != "" {
+		ns = configuredNamespace
+	} else {
+		ns = constants.IstioSystemNamespace
+	}
+	opts := &helmreconciler.ProcessDefaultWebhookOptions{
+		Namespace: ns,
+		DryRun:    false,
+	}
+	if _, err := helmreconciler.ProcessDefaultWebhook(client, iop, exists, opts); err != nil {
+		return fmt.Errorf("failed to process default webhook: %v", err)
+	}
+	return nil
 }
 
 // mergeIOPSWithProfile overlays the values in iop on top of the defaults for the profile given by iop.profile and
@@ -477,7 +495,7 @@ func Add(mgr manager.Manager, options *Options) error {
 func add(mgr manager.Manager, r *ReconcileIstioOperator, options *Options) error {
 	scope.Info("Adding controller for IstioOperator.")
 	// Create a new controller
-	opts := controller.Options{Reconciler: r, Controller: config.Controller{MaxConcurrentReconciles: options.MaxConcurrentReconciles}}
+	opts := controller.Options{Reconciler: r, MaxConcurrentReconciles: options.MaxConcurrentReconciles}
 	c, err := controller.New("istiocontrolplane-controller", mgr, opts)
 	if err != nil {
 		return err

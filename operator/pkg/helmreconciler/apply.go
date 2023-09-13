@@ -40,7 +40,6 @@ const fieldOwnerOperator = "istio-operator"
 func (h *HelmReconciler) ApplyManifest(manifest name.Manifest, serverSideApply bool) (object.K8sObjects, int, error) {
 	var processedObjects object.K8sObjects
 	var deployedObjects int
-	var errs util.Errors
 	cname := string(manifest.Name)
 	crHash, err := h.getCRHash(cname)
 	if err != nil {
@@ -100,9 +99,8 @@ func (h *HelmReconciler) ApplyManifest(manifest name.Manifest, serverSideApply b
 				return nil, 0, err
 			}
 			if err := h.ApplyObject(obj.UnstructuredObject(), serverSideApply); err != nil {
-				scope.Error(err.Error())
-				errs = util.AppendErr(errs, err)
-				continue
+				plog.ReportError(err.Error())
+				return processedObjects, 0, err
 			}
 			plog.ReportProgress()
 			metrics.AddResource(obj.FullName(), obj.GroupVersionKind().GroupKind())
@@ -125,11 +123,6 @@ func (h *HelmReconciler) ApplyManifest(manifest name.Manifest, serverSideApply b
 	}
 
 	if len(changedObjectKeys) > 0 {
-		if len(errs) != 0 {
-			plog.ReportError(util.ToString(errs.Dedup(), "\n"))
-			return processedObjects, 0, errs.ToError()
-		}
-
 		err := WaitForResources(processedObjects, h.kubeClient,
 			h.opts.WaitTimeout, h.opts.DryRun, plog)
 		if err != nil {
@@ -162,8 +155,10 @@ func (h *HelmReconciler) ApplyObject(obj *unstructured.Unstructured, serverSideA
 		return errs.ToError()
 	}
 
-	if err := kubectlutil.CreateApplyAnnotation(obj, unstructured.UnstructuredJSONScheme); err != nil {
-		scope.Errorf("unexpected error adding apply annotation to object: %s", err)
+	if !serverSideApply {
+		if err := kubectlutil.CreateApplyAnnotation(obj, unstructured.UnstructuredJSONScheme); err != nil {
+			scope.Errorf("unexpected error adding apply annotation to object: %s", err)
+		}
 	}
 
 	objectKey := client.ObjectKeyFromObject(obj)
@@ -205,10 +200,17 @@ func (h *HelmReconciler) ApplyObject(obj *unstructured.Unstructured, serverSideA
 			// The correct way to do this is with a server-side apply. However, this requires users to be running Kube 1.16.
 			// When we no longer support < 1.16 use the code described in the linked issue.
 			// https://github.com/kubernetes-sigs/controller-runtime/issues/347
-			if err := applyOverlay(receiver, obj); err != nil {
-				return err
+			var updateObj *unstructured.Unstructured
+			if strings.EqualFold(obj.GetKind(), "IstioOperator") {
+				obj.SetResourceVersion(receiver.GetResourceVersion())
+				updateObj = obj
+			} else {
+				if err := applyOverlay(receiver, obj); err != nil {
+					return err
+				}
+				updateObj = receiver
 			}
-			if err := h.client.Update(context.TODO(), receiver); err != nil {
+			if err := h.client.Update(context.TODO(), updateObj); err != nil {
 				return err
 			}
 			metrics.ResourceUpdateTotal.

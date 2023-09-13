@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/netip"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -39,16 +40,16 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
-	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pilot/pkg/xds/endpoints"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/config/xds"
+	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
-	istiolog "istio.io/pkg/log"
 )
 
 var indexTmpl = template.Must(template.New("index").Parse(`<html>
@@ -143,7 +144,6 @@ type SyncedVersions struct {
 // InitDebug initializes the debug handlers and adds a debug in-memory registry.
 func (s *DiscoveryServer) InitDebug(
 	mux *http.ServeMux,
-	sctl *aggregate.Controller,
 	enableProfiling bool,
 	fetchWebhook func() map[string]string,
 ) *http.ServeMux {
@@ -160,6 +160,8 @@ func (s *DiscoveryServer) AddDebugHandlers(mux, internalMux *http.ServeMux, enab
 	}
 
 	if enableProfiling {
+		runtime.SetMutexProfileFraction(features.MutexProfileFraction)
+		runtime.SetBlockProfileRate(features.MutexProfileFraction)
 		s.addDebugHandler(mux, internalMux, "/debug/pprof/", "Displays pprof index", pprof.Index)
 		s.addDebugHandler(mux, internalMux, "/debug/pprof/cmdline", "The command line invocation of the current program", pprof.Cmdline)
 		s.addDebugHandler(mux, internalMux, "/debug/pprof/profile", "CPU profile", pprof.Profile)
@@ -183,7 +185,7 @@ func (s *DiscoveryServer) AddDebugHandlers(mux, internalMux *http.ServeMux, enab
 	s.addDebugHandler(mux, internalMux, "/debug/config_distribution", "Version status of all Envoys connected to this Pilot instance", s.distributedVersions)
 
 	s.addDebugHandler(mux, internalMux, "/debug/registryz", "Debug support for registry", s.registryz)
-	s.addDebugHandler(mux, internalMux, "/debug/endpointz", "Debug support for endpoints", s.endpointz)
+	s.addDebugHandler(mux, internalMux, "/debug/endpointz", "Obsolete, use endpointShardz", s.endpointShardz)
 	s.addDebugHandler(mux, internalMux, "/debug/endpointShardz", "Info about the endpoint shards", s.endpointShardz)
 	s.addDebugHandler(mux, internalMux, "/debug/cachez", "Info about the internal XDS caches", s.cachez)
 	s.addDebugHandler(mux, internalMux, "/debug/cachez?sizes=true", "Info about the size of the internal XDS caches", s.cachez)
@@ -265,15 +267,17 @@ func isRequestFromLocalhost(r *http.Request) bool {
 
 // Syncz dumps the synchronization status of all Envoys connected to this Pilot instance
 func (s *DiscoveryServer) Syncz(w http.ResponseWriter, req *http.Request) {
+	namespace := req.URL.Query().Get("namespace")
+
 	syncz := make([]SyncStatus, 0)
-	for _, con := range s.Clients() {
+	for _, con := range s.SortedClients() {
 		node := con.proxy
-		if node != nil {
+		if node != nil && (namespace == "" || node.GetNamespace() == namespace) {
 			syncz = append(syncz, SyncStatus{
 				ProxyID:              node.ID,
 				ProxyType:            node.Type,
-				ClusterID:            node.Metadata.ClusterID.String(),
-				IstioVersion:         node.Metadata.IstioVersion,
+				ClusterID:            node.GetClusterID().String(),
+				IstioVersion:         node.GetIstioVersion(),
 				ClusterSent:          con.NonceSent(v3.ClusterType),
 				ClusterAcked:         con.NonceAcked(v3.ClusterType),
 				ListenerSent:         con.NonceSent(v3.ListenerType),
@@ -317,7 +321,7 @@ func (s *DiscoveryServer) cachez(w http.ResponseWriter, req *http.Request) {
 	}
 	if req.Form.Get("sizes") != "" {
 		snapshot := s.Cache.Snapshot()
-		res := make(map[string]string, len(snapshot))
+		raw := make(map[string]int, len(snapshot))
 		totalSize := 0
 		for _, resource := range snapshot {
 			if resource == nil {
@@ -325,8 +329,12 @@ func (s *DiscoveryServer) cachez(w http.ResponseWriter, req *http.Request) {
 			}
 			resourceType := resource.Resource.TypeUrl
 			sz := len(resource.Resource.GetValue())
-			res[resourceType] += util.ByteCount(sz)
+			raw[resourceType] += sz
 			totalSize += sz
+		}
+		res := make(map[string]string, len(raw))
+		for k, v := range raw {
+			res[k] = util.ByteCount(v)
 		}
 		res["total"] = util.ByteCount(totalSize)
 		writeJSON(w, res, req)
@@ -344,42 +352,6 @@ func (s *DiscoveryServer) cachez(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, resources, req)
 }
 
-type endpointzResponse struct {
-	Service   string                   `json:"svc"`
-	Endpoints []*model.ServiceInstance `json:"ep"`
-}
-
-// Endpoint debugging
-func (s *DiscoveryServer) endpointz(w http.ResponseWriter, req *http.Request) {
-	if _, f := req.URL.Query()["brief"]; f {
-		svc := s.Env.ServiceDiscovery.Services()
-		for _, ss := range svc {
-			for _, p := range ss.Ports {
-				all := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port)
-				for _, svc := range all {
-					_, _ = fmt.Fprintf(w, "%s:%s %s:%d %v %s\n", ss.Hostname,
-						p.Name, svc.Endpoint.Address, svc.Endpoint.EndpointPort, svc.Endpoint.Labels,
-						svc.Endpoint.ServiceAccount)
-				}
-			}
-		}
-		return
-	}
-
-	svc := s.Env.ServiceDiscovery.Services()
-	resp := make([]endpointzResponse, 0)
-	for _, ss := range svc {
-		for _, p := range ss.Ports {
-			all := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port)
-			resp = append(resp, endpointzResponse{
-				Service:   fmt.Sprintf("%s:%s", ss.Hostname, p.Name),
-				Endpoints: all,
-			})
-		}
-	}
-	writeJSON(w, resp, req)
-}
-
 const DistributionTrackingDisabledMessage = "Pilot Version tracking is disabled. It may be enabled by setting the " +
 	"PILOT_ENABLE_CONFIG_DISTRIBUTION_TRACKING environment variable to true."
 
@@ -393,7 +365,7 @@ func (s *DiscoveryServer) distributedVersions(w http.ResponseWriter, req *http.R
 		proxyNamespace := req.URL.Query().Get("proxy_namespace")
 		knownVersions := make(map[string]string)
 		var results []SyncedVersions
-		for _, con := range s.Clients() {
+		for _, con := range s.SortedClients() {
 			// wrap this in independent scope so that panic's don't bypass Unlock...
 			con.proxy.RLock()
 
@@ -517,17 +489,29 @@ type TelemetryDebug struct {
 }
 
 func (s *DiscoveryServer) telemetryz(w http.ResponseWriter, req *http.Request) {
-	info := TelemetryDebug{
-		Telemetries: s.globalPushContext().Telemetry,
+	proxyID, con := s.getDebugConnection(req)
+	if proxyID != "" && con == nil {
+		// We can't guarantee the Pilot we are connected to has a connection to the proxy we requested
+		// There isn't a great way around this, but for debugging purposes its suitable to have the caller retry.
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("Proxy not connected to this Pilot instance. It may be connected to another instance.\n"))
+		return
 	}
-	writeJSON(w, info, req)
+	if con == nil {
+		info := TelemetryDebug{
+			Telemetries: s.globalPushContext().Telemetry,
+		}
+		writeJSON(w, info, req)
+		return
+	}
+	writeJSON(w, s.globalPushContext().Telemetry.Debug(con.proxy), req)
 }
 
 // connectionsHandler implements interface for displaying current connections.
 // It is mapped to /debug/connections.
 func (s *DiscoveryServer) connectionsHandler(w http.ResponseWriter, req *http.Request) {
 	adsClients := &AdsClients{}
-	connections := s.Clients()
+	connections := s.SortedClients()
 	adsClients.Total = len(connections)
 
 	for _, c := range connections {
@@ -559,7 +543,7 @@ func (s *DiscoveryServer) adsz(w http.ResponseWriter, req *http.Request) {
 	if con != nil {
 		connections = []*Connection{con}
 	} else {
-		connections = s.Clients()
+		connections = s.SortedClients()
 	}
 
 	adsClients := &AdsClients{}
@@ -585,9 +569,6 @@ func (s *DiscoveryServer) adsz(w http.ResponseWriter, req *http.Request) {
 		c.proxy.RUnlock()
 		adsClients.Connected = append(adsClients.Connected, adsClient)
 	}
-	sort.Slice(adsClients.Connected, func(i, j int) bool {
-		return adsClients.Connected[i].ConnectionID < adsClients.Connected[j].ConnectionID
-	})
 	writeJSON(w, adsClients, req)
 }
 
@@ -633,7 +614,7 @@ func (s *DiscoveryServer) ConfigDump(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if con.proxy.IsZTunnel() {
-		resources := s.getConfigDumpByResourceType(con, nil, []string{v3.WorkloadType})
+		resources := s.getConfigDumpByResourceType(con, nil, []string{v3.AddressType})
 		configDump := &admin.ConfigDump{}
 		for _, resource := range resources {
 			for _, rr := range resource {
@@ -706,7 +687,7 @@ func (s *DiscoveryServer) getConfigDumpByResourceType(conn *Connection, req *mod
 				case v3.ExtensionConfigurationType:
 					tce := &core.TypedExtensionConfig{}
 					if err := rr.GetResource().UnmarshalTo(tce); err != nil {
-						istiolog.Warnf("failed to unmarshal extenstion: %v", err)
+						istiolog.Warnf("failed to unmarshal extension: %v", err)
 						continue
 					}
 
@@ -917,6 +898,7 @@ func (s *DiscoveryServer) pushStatusHandler(w http.ResponseWriter, req *http.Req
 type PushContextDebug struct {
 	AuthorizationPolicies *model.AuthorizationPolicies
 	NetworkGateways       []model.NetworkGateway
+	UnresolvedGateways    []model.NetworkGateway
 }
 
 // pushContextHandler dumps the current PushContext
@@ -929,6 +911,7 @@ func (s *DiscoveryServer) pushContextHandler(w http.ResponseWriter, req *http.Re
 	push.AuthorizationPolicies = pc.AuthzPolicies
 	if pc.NetworkManager() != nil {
 		push.NetworkGateways = pc.NetworkManager().AllGateways()
+		push.UnresolvedGateways = pc.NetworkManager().Unresolved.AllGateways()
 	}
 
 	writeJSON(w, push, req)
@@ -1024,7 +1007,8 @@ func (s *DiscoveryServer) Edsz(w http.ResponseWriter, req *http.Request) {
 	clusters := con.Clusters()
 	eps := make([]jsonMarshalProto, 0, len(clusters))
 	for _, clusterName := range clusters {
-		eps = append(eps, jsonMarshalProto{s.generateEndpoints(NewEndpointBuilder(clusterName, con.proxy, con.proxy.LastPushContext))})
+		builder := endpoints.NewEndpointBuilder(clusterName, con.proxy, con.proxy.LastPushContext)
+		eps = append(eps, jsonMarshalProto{builder.BuildClusterLoadAssignment(s.Env.EndpointIndex)})
 	}
 	writeJSON(w, eps, req)
 }
@@ -1073,11 +1057,11 @@ func (s *DiscoveryServer) getProxyConnection(proxyID string) *Connection {
 }
 
 func (s *DiscoveryServer) instancesz(w http.ResponseWriter, req *http.Request) {
-	instances := map[string][]*model.ServiceInstance{}
+	instances := map[string][]model.ServiceTarget{}
 	for _, con := range s.Clients() {
 		con.proxy.RLock()
 		if con.proxy != nil {
-			instances[con.proxy.ID] = con.proxy.ServiceInstances
+			instances[con.proxy.ID] = con.proxy.ServiceTargets
 		}
 		con.proxy.RUnlock()
 	}
@@ -1111,7 +1095,7 @@ func sortMCSServices(svcs []model.MCSServiceInfo) []model.MCSServiceInfo {
 
 func (s *DiscoveryServer) clusterz(w http.ResponseWriter, req *http.Request) {
 	if s.ListRemoteClusters == nil {
-		w.WriteHeader(400)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, s.ListRemoteClusters(), req)

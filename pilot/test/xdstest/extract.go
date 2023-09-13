@@ -28,17 +28,17 @@ import (
 	tcpproxy "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"golang.org/x/exp/maps"
 	"google.golang.org/protobuf/proto"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/wellknown"
 )
 
 func ExtractResource(res model.Resources) sets.String {
@@ -246,6 +246,17 @@ func ExtractHTTPConnectionManager(t test.Failer, fcs *listener.FilterChain) *hcm
 		}
 	}
 	return nil
+}
+
+func ExtractLocalityLbEndpoints(cla []*endpoint.ClusterLoadAssignment) map[string][]*endpoint.LocalityLbEndpoints {
+	got := map[string][]*endpoint.LocalityLbEndpoints{}
+	for _, cla := range cla {
+		if cla == nil {
+			continue
+		}
+		got[cla.ClusterName] = cla.Endpoints
+	}
+	return got
 }
 
 func ExtractLoadAssignments(cla []*endpoint.ClusterLoadAssignment) map[string][]string {

@@ -22,7 +22,6 @@ import (
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	redis "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	networking "istio.io/api/networking/v1alpha3"
@@ -36,6 +35,7 @@ import (
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/wellknown"
 )
 
 func TestBuildRedisFilter(t *testing.T) {
@@ -96,6 +96,9 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 			fcc := inboundChainConfig{
 				telemetryMetadata: telemetry.FilterChainMetadata{InstanceHostname: "v0.default.example.org"},
 				clusterName:       "inbound|8888||",
+				port: model.ServiceInstancePort{
+					ServicePort: &model.Port{},
+				},
 			}
 
 			listenerFilters := NewListenerBuilder(cg.SetupProxy(nil), cg.PushContext()).buildInboundNetworkFilters(fcc)
@@ -120,6 +123,7 @@ func TestInboundNetworkFilterOrder(t *testing.T) {
 
 		fcc := inboundChainConfig{
 			clusterName: "inbound|8888||",
+			port:        model.ServiceInstancePort{ServicePort: &model.Port{}},
 		}
 		push := cg.PushContext()
 		push.AuthzPolicies = getAuthorizationPolicies()
@@ -168,7 +172,9 @@ func TestInboundNetworkFilterIdleTimeout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cg := NewConfigGenTest(t, TestOptions{Services: services})
 
-			fcc := inboundChainConfig{}
+			fcc := inboundChainConfig{
+				port: model.ServiceInstancePort{ServicePort: &model.Port{}},
+			}
 			node := &model.Proxy{Metadata: &model.NodeMetadata{IdleTimeout: tt.idleTimeout}}
 			listenerFilters := NewListenerBuilder(cg.SetupProxy(node), cg.PushContext()).buildInboundNetworkFilters(fcc)
 			tcp := &tcp.TcpProxy{}

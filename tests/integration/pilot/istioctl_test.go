@@ -35,12 +35,9 @@ import (
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	commonDeployment "istio.io/istio/pkg/test/framework/components/echo/common/deployment"
-	"istio.io/istio/pkg/test/framework/components/echo/deployment"
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/components/namespace"
-	kubetest "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/istio/pkg/url"
 	"istio.io/istio/pkg/util/protomarshal"
 )
 
@@ -57,10 +54,6 @@ var (
 `)
 
 	describePodAOutput = describeSvcAOutput
-
-	addToMeshPodAOutput = `deployment .* updated successfully with Istio sidecar injected.
-Next Step: Add related labels to the deployment to align with Istio's requirement: ` + url.DeploymentRequirements
-	removeFromMeshPodAOutput = `deployment .* updated successfully with Istio sidecar un-injected.`
 )
 
 func TestWait(t *testing.T) {
@@ -206,62 +199,6 @@ func getPodID(i echo.Instance) (string, error) {
 	return "", fmt.Errorf("no workloads")
 }
 
-func TestAddToAndRemoveFromMesh(t *testing.T) {
-	// nolint: staticcheck
-	framework.NewTest(t).Features("usability.helpers.add-to-mesh", "usability.helpers.remove-from-mesh").
-		RequiresSingleCluster().
-		RequiresLocalControlPlane().
-		RunParallel(func(t framework.TestContext) {
-			ns := namespace.NewOrFail(t, t, namespace.Config{
-				Prefix: "istioctl-add-to-mesh",
-				Inject: true,
-			})
-
-			var a echo.Instance
-			deployment.New(t).
-				With(&a, echoConfig(ns, "a")).
-				BuildOrFail(t)
-
-			istioCtl := istioctl.NewOrFail(t, t, istioctl.Config{Cluster: t.Clusters().Default()})
-
-			var output string
-			var args []string
-			g := gomega.NewWithT(t)
-
-			// able to remove from mesh when the deployment is auto injected
-			args = []string{
-				fmt.Sprintf("--namespace=%s", ns.Name()),
-				"x", "remove-from-mesh", "service", "a",
-			}
-			output, _ = istioCtl.InvokeOrFail(t, args)
-			g.Expect(output).To(gomega.MatchRegexp(removeFromMeshPodAOutput))
-
-			retry.UntilSuccessOrFail(t, func() error {
-				// Wait until the new pod is ready
-				fetch := kubetest.NewPodMustFetch(t.Clusters().Default(), ns.Name(), "app=a")
-				pods, err := kubetest.WaitUntilPodsAreReady(fetch)
-				if err != nil {
-					return err
-				}
-				for _, p := range pods {
-					for _, c := range p.Spec.Containers {
-						if c.Name == "istio-proxy" {
-							return fmt.Errorf("sidecar still present in %v", p.Name)
-						}
-					}
-				}
-				return nil
-			}, retry.Delay(time.Second), retry.Timeout(time.Minute))
-
-			args = []string{
-				fmt.Sprintf("--namespace=%s", ns.Name()),
-				"x", "add-to-mesh", "service", "a",
-			}
-			output, _ = istioCtl.InvokeOrFail(t, args)
-			g.Expect(output).To(gomega.MatchRegexp(addToMeshPodAOutput))
-		})
-}
-
 func TestProxyConfig(t *testing.T) {
 	// nolint: staticcheck
 	framework.NewTest(t).Features("usability.observability.proxy-config").
@@ -317,6 +254,34 @@ func TestProxyConfig(t *testing.T) {
 			output, _ = istioCtl.InvokeOrFail(t, args)
 			jsonOutput = jsonUnmarshallOrFail(t, strings.Join(args, " "), output)
 			g.Expect(jsonOutput).To(gomega.Not(gomega.BeEmpty()))
+
+			args = []string{
+				"--namespace=dummy",
+				"pc", "all", fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()), "-o", "json",
+			}
+			output, _ = istioCtl.InvokeOrFail(t, args)
+			jsonOutput = jsonUnmarshallOrFail(t, strings.Join(args, " "), output)
+			dumpAll, ok := jsonOutput.(map[string]any)
+			if !ok {
+				t.Fatalf("Failed to parse istioctl %s config dump to top level map", strings.Join(args, " "))
+			}
+			rawConfigs, ok := dumpAll["configs"].([]any)
+			if !ok {
+				t.Fatalf("Failed to parse istioctl %s config dump to slice of any", strings.Join(args, " "))
+			}
+			hasEndpoints := false
+			for _, rawConfig := range rawConfigs {
+				configDump, ok := rawConfig.(map[string]any)
+				if !ok {
+					t.Fatalf("Failed to parse istioctl %s raw config dump element to map of any", strings.Join(args, " "))
+				}
+				if configDump["@type"] == "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump" {
+					hasEndpoints = true
+					break
+				}
+			}
+
+			g.Expect(hasEndpoints).To(gomega.BeTrue())
 
 			args = []string{
 				"--namespace=dummy",
@@ -415,6 +380,13 @@ func TestProxyStatus(t *testing.T) {
 				}
 				return expectSubstrings(output, "Clusters Match", "Listeners Match", "Routes Match")
 			})
+
+			// test namespace filtering
+			retry.UntilSuccessOrFail(t, func() error {
+				args = []string{"proxy-status", "-n", apps.Namespace.Name()}
+				output, _ = istioCtl.InvokeOrFail(t, args)
+				return expectSubstrings(output, fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()))
+			})
 		})
 }
 
@@ -424,6 +396,7 @@ func TestXdsProxyStatus(t *testing.T) {
 	framework.NewTest(t).Features("usability.observability.proxy-status").
 		RequiresSingleCluster().
 		Run(func(t framework.TestContext) {
+			const timeoutFlag = "--timeout=10s"
 			istioCtl := istioctl.NewOrFail(t, t, istioctl.Config{})
 
 			podID, err := getPodID(apps.A[0])
@@ -443,7 +416,7 @@ func TestXdsProxyStatus(t *testing.T) {
 			}
 
 			retry.UntilSuccessOrFail(t, func() error {
-				args := []string{"x", "proxy-status"}
+				args := []string{"x", "proxy-status", timeoutFlag}
 				output, _, err := istioCtl.Invoke(args)
 				if err != nil {
 					return err
@@ -455,7 +428,7 @@ func TestXdsProxyStatus(t *testing.T) {
 
 			retry.UntilSuccessOrFail(t, func() error {
 				args := []string{
-					"proxy-status", fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()),
+					"x", "proxy-status", fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()), timeoutFlag,
 				}
 				output, _, err := istioCtl.Invoke(args)
 				if err != nil {
@@ -474,13 +447,23 @@ func TestXdsProxyStatus(t *testing.T) {
 				err = os.WriteFile(filename, dump, os.ModePerm)
 				g.Expect(err).ShouldNot(gomega.HaveOccurred())
 				args := []string{
-					"proxy-status", fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()), "--file", filename,
+					"x", "proxy-status", fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()), "--file", filename, timeoutFlag,
 				}
 				output, _, err := istioCtl.Invoke(args)
 				if err != nil {
 					return err
 				}
 				return expectSubstrings(output, "Clusters Match", "Listeners Match", "Routes Match")
+			})
+
+			// test namespace filtering
+			retry.UntilSuccessOrFail(t, func() error {
+				args := []string{"x", "proxy-status", "-n", apps.Namespace.Name()}
+				output, _, err := istioCtl.Invoke(args)
+				if err != nil {
+					return err
+				}
+				return expectSubstrings(output, fmt.Sprintf("%s.%s", podID, apps.Namespace.Name()))
 			})
 		})
 }

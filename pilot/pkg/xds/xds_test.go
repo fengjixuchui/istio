@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 
 	"istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
@@ -31,6 +30,7 @@ import (
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/structpath"
+	"istio.io/istio/pkg/wellknown"
 )
 
 type SidecarTestConfig struct {
@@ -445,19 +445,20 @@ metadata:
   name: echo-app-%s
   namespace: default
 ---
-apiVersion: v1
-kind: Endpoints
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
 metadata:
   name: echo-app
   namespace: default
   labels:
     app: echo-app
-subsets:
+    kubernetes.io/service-name: echo-app
+endpoints:
 - addresses:
-  - ip: 10.0.0.%d
-  ports:
-  - name: grpc
-    port: 7070
+  - 10.0.0.%d
+ports:
+- name: grpc
+  port: 7070
 `, clusterID, i)
 					i++
 				}

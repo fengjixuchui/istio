@@ -23,22 +23,23 @@ import (
 	redis "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	hashpolicy "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	extensions "istio.io/api/extensions/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
+	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/extension"
 	istioroute "istio.io/istio/pilot/pkg/networking/core/v1alpha3/route"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/tunnelingconfig"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
-	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/wellknown"
 )
 
 // redisOpTimeout is the default operation timeout for the Redis proxy filter.
@@ -88,11 +89,7 @@ func buildOutboundNetworkFiltersWithSingleDestination(push *model.PushContext, n
 	tcpProxy := &tcp.TcpProxy{
 		StatPrefix:       statPrefix,
 		ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: clusterName},
-	}
-
-	idleTimeout, err := time.ParseDuration(node.Metadata.IdleTimeout)
-	if err == nil {
-		tcpProxy.IdleTimeout = durationpb.New(idleTimeout)
+		IdleTimeout:      parseDuration(node.Metadata.IdleTimeout),
 	}
 	maxConnectionDuration := destinationRule.GetTrafficPolicy().GetConnectionPool().GetTcp().GetMaxConnectionDuration()
 	if maxConnectionDuration != nil {
@@ -107,6 +104,13 @@ func buildOutboundNetworkFiltersWithSingleDestination(push *model.PushContext, n
 	if !node.IsAmbient() {
 		filters = append(filters, buildMetadataExchangeNetworkFilters(class)...)
 	}
+	wasm := push.WasmPluginsByListenerInfo(node, model.WasmPluginListenerInfo{
+		Port:  port.Port,
+		Class: class,
+	}, model.WasmPluginTypeNetwork)
+
+	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHN)
+	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHZ)
 	filters = append(filters, buildMetricsNetworkFilters(push, node, class)...)
 	filters = append(filters, buildNetworkFiltersStack(port.Protocol, tcpFilter, statPrefix, clusterName)...)
 	return filters
@@ -125,12 +129,10 @@ func buildOutboundNetworkFiltersWithWeightedClusters(node *model.Proxy, routes [
 	tcpProxy := &tcp.TcpProxy{
 		StatPrefix:       statPrefix,
 		ClusterSpecifier: clusterSpecifier,
+
+		IdleTimeout: parseDuration(node.Metadata.IdleTimeout),
 	}
 
-	idleTimeout, err := time.ParseDuration(node.Metadata.IdleTimeout)
-	if err == nil {
-		tcpProxy.IdleTimeout = durationpb.New(idleTimeout)
-	}
 	maxConnectionDuration := destinationRule.GetTrafficPolicy().GetConnectionPool().GetTcp().GetMaxConnectionDuration()
 	if maxConnectionDuration != nil {
 		tcpProxy.MaxDownstreamConnectionDuration = maxConnectionDuration
@@ -162,7 +164,17 @@ func buildOutboundNetworkFiltersWithWeightedClusters(node *model.Proxy, routes [
 	if !node.IsAmbient() {
 		filters = append(filters, buildMetadataExchangeNetworkFilters(class)...)
 	}
+	wasm := push.WasmPluginsByListenerInfo(node, model.WasmPluginListenerInfo{
+		Port:  port.Port,
+		Class: class,
+	}, model.WasmPluginTypeNetwork)
+
+	filters = append(filters, extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHN)...)
+	filters = append(filters, extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHZ)...)
+	filters = append(filters, extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_STATS)...)
 	filters = append(filters, buildMetricsNetworkFilters(push, node, class)...)
+	filters = append(filters, extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)...)
+	filters = append(filters, buildNetworkFiltersStack(port.Protocol, tcpFilter, statPrefix, clusterName)...)
 	filters = append(filters, buildNetworkFiltersStack(port.Protocol, tcpFilter, statPrefix, clusterName)...)
 	return filters
 }
@@ -242,7 +254,7 @@ func buildOutboundNetworkFilters(node *model.Proxy,
 		// If stat name is configured, build the stat prefix from configured pattern.
 		if len(push.Mesh.OutboundClusterStatName) != 0 && service != nil {
 			statPrefix = telemetry.BuildStatPrefix(push.Mesh.OutboundClusterStatName, routes[0].Destination.Host,
-				routes[0].Destination.Subset, port, &service.Attributes)
+				routes[0].Destination.Subset, port, 0, &service.Attributes)
 		}
 
 		return buildOutboundNetworkFiltersWithSingleDestination(
@@ -267,22 +279,6 @@ func buildMongoFilter(statPrefix string) *listener.Filter {
 	}
 
 	return out
-}
-
-// buildOutboundAutoPassthroughFilterStack builds a filter stack with sni_cluster and tcp
-// used by auto_passthrough gateway servers
-func buildOutboundAutoPassthroughFilterStack(push *model.PushContext, node *model.Proxy, port *model.Port) []*listener.Filter {
-	// First build tcp with access logs
-	// then add sni_cluster to the front
-	tcpProxy := buildOutboundNetworkFiltersWithSingleDestination(push, node, util.BlackHoleCluster, util.BlackHoleCluster,
-		"", port, nil, tunnelingconfig.Skip)
-	filterstack := make([]*listener.Filter, 0)
-	filterstack = append(filterstack, &listener.Filter{
-		Name: util.SniClusterFilter,
-	})
-	filterstack = append(filterstack, tcpProxy...)
-
-	return filterstack
 }
 
 // buildRedisFilter builds an outbound Envoy RedisProxy filter.

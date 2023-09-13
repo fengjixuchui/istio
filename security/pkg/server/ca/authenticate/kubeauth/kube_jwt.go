@@ -26,11 +26,11 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/jwt"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/k8s/tokenreview"
 	"istio.io/istio/security/pkg/util"
-	"istio.io/pkg/log"
 )
 
 const (
@@ -121,7 +121,7 @@ func (a *KubeJWTAuthenticator) authenticate(targetJWT string, clusterID cluster.
 	}
 	var aud []string
 
-	// If the token has audience - we will validate it by setting in in the audiences field,
+	// If the token has audience - we will validate it by setting it in the audiences field,
 	// This happens regardless of Require3PToken setting.
 	//
 	// If 'Require3PToken' is set - we will also set the audiences field, forcing the check.

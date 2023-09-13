@@ -67,16 +67,12 @@ func TestProxyNeedsPush(t *testing.T) {
 	for kind, name := range sidecarScopeKindNames {
 		sidecar.SidecarScope.AddConfigDependencies(model.ConfigKey{Kind: kind, Name: name, Namespace: nsName}.HashCode())
 	}
-	for kind, types := range configKindAffectedProxyTypes {
-		for _, nodeType := range types {
-			if nodeType == model.SidecarProxy {
-				sidecar.SidecarScope.AddConfigDependencies(model.ConfigKey{
-					Kind:      kind,
-					Name:      generalName,
-					Namespace: nsName,
-				}.HashCode())
-			}
-		}
+	for kind := range UnAffectedConfigKinds[model.SidecarProxy] {
+		sidecar.SidecarScope.AddConfigDependencies(model.ConfigKey{
+			Kind:      kind,
+			Name:      generalName,
+			Namespace: nsName,
+		}.HashCode())
 	}
 
 	cases := []Case{
@@ -154,29 +150,19 @@ func TestProxyNeedsPush(t *testing.T) {
 	}
 
 	// tests for kind-affect-proxy.
-	for k, types := range configKindAffectedProxyTypes {
-		for _, nodeType := range []model.NodeType{model.Router, model.SidecarProxy} {
-			affected := false
-			for _, affectedType := range types {
-				if nodeType == affectedType {
-					affected = true
-					break
-				}
-			}
+	for _, nodeType := range []model.NodeType{model.Router, model.SidecarProxy} {
+		proxy := gateway
+		if nodeType == model.SidecarProxy {
+			proxy = sidecar
+		}
+		for k := range UnAffectedConfigKinds[proxy.Type] {
+			cases = append(cases, Case{
+				name:    fmt.Sprintf("kind %s not affect %s", k.String(), nodeType),
+				proxy:   proxy,
+				configs: sets.New(model.ConfigKey{Kind: k, Name: generalName + invalidNameSuffix, Namespace: nsName}),
 
-			if !affected {
-				proxy := gateway
-				if nodeType == model.SidecarProxy {
-					proxy = sidecar
-				}
-				cases = append(cases, Case{
-					name:    fmt.Sprintf("kind %s not affect %s", k.String(), nodeType),
-					proxy:   proxy,
-					configs: sets.New(model.ConfigKey{Kind: k, Name: generalName + invalidNameSuffix, Namespace: nsName}),
-
-					want: false,
-				})
-			}
+				want: false,
+			})
 		}
 	}
 
@@ -186,21 +172,21 @@ func TestProxyNeedsPush(t *testing.T) {
 			{
 				Hostname: svcName,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},
 			{
 				Hostname: privateSvcName,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.None: true},
+					ExportTo:  sets.New(visibility.None),
 					Namespace: nsName,
 				},
 			},
 			{
 				Hostname: "foo",
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},
@@ -214,14 +200,14 @@ func TestProxyNeedsPush(t *testing.T) {
 			{
 				Hostname: svcName,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},
 			{
 				Hostname: privateSvcName,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.None: true},
+					ExportTo:  sets.New(visibility.None),
 					Namespace: nsName,
 				},
 			},
@@ -229,7 +215,7 @@ func TestProxyNeedsPush(t *testing.T) {
 				Hostname: "foo",
 				Attributes: model.ServiceAttributes{
 					// service visibility changed from public to none
-					ExportTo:  map[visibility.Instance]bool{visibility.None: true},
+					ExportTo:  sets.New(visibility.None),
 					Namespace: nsName,
 				},
 			},
@@ -280,21 +266,21 @@ func TestProxyNeedsPush(t *testing.T) {
 			{
 				Hostname: fooSvc,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},
 			{
 				Hostname: svcName,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},
 			{
 				Hostname: extensionSvc,
 				Attributes: model.ServiceAttributes{
-					ExportTo:  map[visibility.Instance]bool{visibility.Public: true},
+					ExportTo:  sets.New(visibility.Public),
 					Namespace: nsName,
 				},
 			},

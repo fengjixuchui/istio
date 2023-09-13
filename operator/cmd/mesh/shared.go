@@ -23,7 +23,6 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"istio.io/istio/istioctl/pkg/install/k8sversion"
@@ -35,11 +34,11 @@ import (
 	"istio.io/istio/operator/pkg/object"
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/pkg/kube"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
 )
 
 // installerScope is the scope for all commands in the mesh package.
-var installerScope = log.RegisterScope("installer", "installer", 0)
+var installerScope = log.RegisterScope("installer", "installer")
 
 type Printer interface {
 	Printf(format string, a ...any)
@@ -110,20 +109,7 @@ func Confirm(msg string, writer io.Writer) bool {
 	}
 }
 
-func KubernetesClients(kubeConfigPath, context string, l clog.Logger) (kube.CLIClient, client.Client, error) {
-	rc, err := kube.DefaultRestConfig(kubeConfigPath, context, func(config *rest.Config) {
-		// We are running a one-off command locally, so we don't need to worry too much about rate limiting
-		// Bumping this up greatly decreases install time
-		config.QPS = 50
-		config.Burst = 100
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	kubeClient, err := kube.NewCLIClient(kube.NewClientConfigForRestConfig(rc), "")
-	if err != nil {
-		return nil, nil, fmt.Errorf("create Kubernetes client: %v", err)
-	}
+func KubernetesClients(kubeClient kube.CLIClient, l clog.Logger) (kube.CLIClient, client.Client, error) {
 	client, err := client.New(kubeClient.RESTConfig(), client.Options{Scheme: kube.IstioScheme})
 	if err != nil {
 		return nil, nil, err

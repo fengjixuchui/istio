@@ -58,6 +58,9 @@ pilot:
   configMap: false
   # Additional labels to apply on the pod level for monitoring and logging configuration.
   podLabels: {}
+  # Setup how istiod Service is configured. See https://kubernetes.io/docs/concepts/services-networking/dual-stack/#services
+  ipFamilyPolicy: ""
+  ipFamilies: []
 sidecarInjectorWebhook:
   # You can use the field called alwaysInjectSelector and neverInjectSelector which will always inject the sidecar or
   # always skip the injection on pods that match that label selector, regardless of the global policy.
@@ -83,7 +86,7 @@ sidecarInjectorWebhook:
   enableNamespacesByDefault: false
   # Mutations that occur after the sidecar injector are not handled by default, as the Istio sidecar injector is only run
   # once. For example, an OPA sidecar injected after the Istio sidecar will not have it's liveness/readiness probes rewritten.
-  # Setting this to `IfNeeded` will result in the sidecar injector being run again if additonal mutations occur.
+  # Setting this to `IfNeeded` will result in the sidecar injector being run again if additional mutations occur.
   reinvocationPolicy: Never
   rewriteAppHTTPProbe: true
   # Templates defines a set of custom injection templates that can be used. For example, defining:

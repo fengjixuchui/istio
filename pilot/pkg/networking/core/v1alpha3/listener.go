@@ -126,7 +126,11 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 	} else if transportProtocol == istionetworking.TransportProtocolTCP &&
 		serverTLSSettings.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL &&
 		gatewayTCPServerWithTerminatingTLS {
-		alpnByTransport = util.ALPNDownstreamWithMxc
+		if features.DisableMxALPN {
+			alpnByTransport = util.ALPNDownstream
+		} else {
+			alpnByTransport = util.ALPNDownstreamWithMxc
+		}
 	}
 
 	ctx := &auth.DownstreamTlsContext{
@@ -766,6 +770,10 @@ func buildSidecarOutboundTCPListenerOpts(opts outboundListenerOpts, virtualServi
 func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundListenerOpts,
 	listenerMap map[listenerKey]*outboundListenerEntry, virtualServices []config.Config, actualWildcards []string,
 ) {
+	// Alias services do not get listeners generated
+	if listenerOpts.service.Resolution == model.Alias {
+		return
+	}
 	// TODO: remove actualWildcard
 	var currentListenerEntry *outboundListenerEntry
 
@@ -1118,10 +1126,6 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		// add extra addresses for the listener
 		if features.EnableDualStack && len(opts.extraBind) > 0 {
 			res.AdditionalAddresses = util.BuildAdditionalAddresses(opts.extraBind, uint32(opts.port))
-		}
-
-		if opts.proxy.Type != model.Router {
-			res.ListenerFiltersTimeout = opts.push.Mesh.ProtocolDetectionTimeout
 		}
 	case istionetworking.TransportProtocolQUIC:
 		// TODO: switch on TransportProtocolQUIC is in too many places now. Once this is a bit

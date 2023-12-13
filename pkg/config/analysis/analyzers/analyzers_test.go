@@ -264,6 +264,27 @@ var testGrid = []testCase{
 		},
 	},
 	{
+		name: "injectionImageDistroless",
+		inputFiles: []string{
+			"testdata/injection-image-distroless.yaml",
+			"testdata/common/sidecar-injector-configmap.yaml",
+		},
+		meshConfigFile: "testdata/common/meshconfig.yaml",
+		analyzer:       &injection.ImageAnalyzer{},
+		expected: []message{
+			{msg.PodsIstioProxyImageMismatchInNamespace, "Namespace enabled-namespace"},
+		},
+	},
+	{
+		name: "injectionImageDistrolessNoMeshConfig",
+		inputFiles: []string{
+			"testdata/injection-image-distroless-no-meshconfig.yaml",
+			"testdata/common/sidecar-injector-configmap.yaml",
+		},
+		analyzer: &injection.ImageAnalyzer{},
+		expected: []message{},
+	},
+	{
 		name: "istioInjectionProxyImageMismatchAbsolute",
 		inputFiles: []string{
 			"testdata/injection-with-mismatched-sidecar.yaml",
@@ -401,6 +422,14 @@ var testGrid = []testCase{
 		analyzer:   &virtualservice.JWTClaimRouteAnalyzer{},
 		expected: []message{
 			{msg.JwtClaimBasedRoutingWithoutRequestAuthN, "VirtualService foo"},
+		},
+	},
+	{
+		name:       "virtualServiceInternalGatewayRef",
+		inputFiles: []string{"testdata/virtualservice_internal_gateway_ref.yaml"},
+		analyzer:   &virtualservice.GatewayAnalyzer{},
+		expected: []message{
+			{msg.ReferencedInternalGateway, "VirtualService httpbin"},
 		},
 	},
 	{

@@ -35,6 +35,7 @@ import (
 	"istio.io/api/label"
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/clioptions"
+	"istio.io/istio/istioctl/pkg/completion"
 	"istio.io/istio/pkg/log"
 )
 
@@ -474,15 +475,18 @@ func istiodLogCmd(ctx cli.Context) *cobra.Command {
 			}
 			return nil
 		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
+		},
 	}
 	opts.AttachControlPlaneFlags(logCmd)
 	logCmd.PersistentFlags().BoolVar(&istiodReset, "reset", istiodReset, "Reset levels to default value. (info)")
 	logCmd.PersistentFlags().IntVar(&controlzPort, "ctrlz_port", 9876, "ControlZ port")
 	logCmd.PersistentFlags().StringVar(&outputLogLevel, "level", outputLogLevel,
-		"Comma-separated list of output logging level for scopes in format <scope>:<level>[,<scope>:<level>,...]"+
+		"Comma-separated list of output logging level for scopes in the format of <scope>:<level>[,<scope>:<level>,...]. "+
 			"Possible values for <level>: none, error, warn, info, debug")
 	logCmd.PersistentFlags().StringVar(&stackTraceLevel, "stack-trace-level", stackTraceLevel,
-		"Comma-separated list of stack trace level  for scopes in format <scope>:<stack-trace-level>[,<scope>:<stack-trace-level>,...] "+
+		"Comma-separated list of stack trace level for scopes in the format of <scope>:<stack-trace-level>[,<scope>:<stack-trace-level>,...]. "+
 			"Possible values for <stack-trace-level>: none, error, warn, info, debug")
 	logCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o",
 		outputFormat, "Output format: one of json|yaml|short")

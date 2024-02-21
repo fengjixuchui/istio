@@ -28,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth" //  allow out of cluster authentication
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -91,21 +90,10 @@ func BuildClientCmd(kubeconfig, context string, overrides ...func(*clientcmd.Con
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
 }
 
-// CreateClientset is a helper function that builds a kubernetes Clienset from a kubeconfig
-// filepath. See `BuildClientConfig` for kubeconfig loading rules.
-func CreateClientset(kubeconfig, context string, fns ...func(*rest.Config)) (*kubernetes.Clientset, error) {
-	c, err := BuildClientConfig(kubeconfig, context)
-	if err != nil {
-		return nil, fmt.Errorf("build client config: %v", err)
-	}
-	for _, fn := range fns {
-		fn(c)
-	}
-	return kubernetes.NewForConfig(c)
-}
-
-// NewRestConfigFromContext returns the rest.Config for the given kube config context.
-func NewRestConfigFromContext(kubeConfig []byte, configOverrides ...func(*rest.Config)) (*rest.Config, error) {
+// NewUntrustedRestConfig returns the rest.Config for the given kube config context.
+// This is suitable for access to remote clusters from untrusted kubeConfig inputs.
+// The kubeconfig is sanitized and unsafe auth methods are denied.
+func NewUntrustedRestConfig(kubeConfig []byte, configOverrides ...func(*rest.Config)) (*rest.Config, error) {
 	if len(kubeConfig) == 0 {
 		return nil, fmt.Errorf("kubeconfig is empty")
 	}
@@ -127,7 +115,23 @@ func NewRestConfigFromContext(kubeConfig []byte, configOverrides ...func(*rest.C
 	for _, co := range configOverrides {
 		co(restConfig)
 	}
-	return restConfig, nil
+
+	return SetRestDefaults(restConfig), nil
+}
+
+// InClusterConfig returns the rest.Config for in cluster usage.
+// Typically, DefaultRestConfig is used and this is auto detected; usage directly allows explicitly overriding to use in-cluster.
+func InClusterConfig(fns ...func(*rest.Config)) (*rest.Config, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, fn := range fns {
+		fn(config)
+	}
+
+	return SetRestDefaults(config), nil
 }
 
 // DefaultRestConfig returns the rest.Config for the given kube config file and context.
@@ -276,6 +280,13 @@ func GetDeployMetaFromPod(pod *corev1.Pod) (metav1.ObjectMeta, metav1.TypeMeta) 
 				name := strings.TrimSuffix(controllerRef.Name, "-"+pod.Labels["pod-template-hash"])
 				deployMeta.Name = name
 				typeMetadata.Kind = "Deployment"
+			} else if typeMetadata.Kind == "ReplicaSet" && pod.Labels["rollouts-pod-template-hash"] != "" &&
+				strings.HasSuffix(controllerRef.Name, pod.Labels["rollouts-pod-template-hash"]) {
+				// Heuristic for ArgoCD Rollout
+				name := strings.TrimSuffix(controllerRef.Name, "-"+pod.Labels["rollouts-pod-template-hash"])
+				deployMeta.Name = name
+				typeMetadata.Kind = "Rollout"
+				typeMetadata.APIVersion = "v1alpha1"
 			} else if typeMetadata.Kind == "ReplicationController" && pod.Labels["deploymentconfig"] != "" {
 				// If the pod is controlled by the replication controller, which is created by the DeploymentConfig resource in
 				// Openshift platform, set the deploy name to the deployment config's name, and the kind to 'DeploymentConfig'.
@@ -295,9 +306,8 @@ func GetDeployMetaFromPod(pod *corev1.Pod) (metav1.ObjectMeta, metav1.TypeMeta) 
 				if jn := cronJobNameRegexp.FindStringSubmatch(controllerRef.Name); len(jn) == 2 {
 					deployMeta.Name = jn[1]
 					typeMetadata.Kind = "CronJob"
-					// heuristically set cron job api version to v1beta1 as it cannot be derived from pod metadata.
-					// Cronjob is not GA yet and latest version is v1beta1: https://github.com/kubernetes/enhancements/pull/978
-					typeMetadata.APIVersion = "batch/v1beta1"
+					// heuristically set cron job api version to v1 as it cannot be derived from pod metadata.
+					typeMetadata.APIVersion = "batch/v1"
 				}
 			}
 		}

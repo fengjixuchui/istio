@@ -49,6 +49,7 @@ import (
 	"istio.io/istio/pkg/config/analysis/diag"
 	"istio.io/istio/pkg/config/analysis/local"
 	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/version"
@@ -274,10 +275,7 @@ func (h *HelmReconciler) DeleteIOPInClusterIfExists(iop *istioV1Alpha1.IstioOper
 	// Delete the previous IstioOperator CR if it exists.
 	objectKey := client.ObjectKeyFromObject(iop)
 	receiver := &unstructured.Unstructured{}
-	receiver.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "install.istio.io",
-		Version: "v1alpha1", Kind: name.IstioOperatorStr,
-	})
+	receiver.SetGroupVersionKind(istioV1Alpha1.IstioOperatorGVK)
 	if err := h.client.Get(context.TODO(), objectKey, receiver); err == nil {
 		_ = h.client.Delete(context.TODO(), receiver)
 	}
@@ -496,12 +494,11 @@ func (h *HelmReconciler) analyzeWebhooks(whs []string) error {
 		return nil
 	}
 
-	sa := local.NewSourceAnalyzer(analysis.Combine("webhook", &webhook.Analyzer{
-		SkipServiceCheck: true,
-	}), resource.Namespace(h.iop.Spec.GetNamespace()), resource.Namespace(istioV1Alpha1.Namespace(h.iop.Spec)), nil)
+	// Add webhook manifests to be applied
 	var localWebhookYAMLReaders []local.ReaderSource
 	var parsedK8sObjects object.K8sObjects
-	for _, wh := range whs {
+	exists := revtag.PreviousInstallExists(context.Background(), h.kubeClient.Kube())
+	for i, wh := range whs {
 		k8sObjects, err := object.ParseK8sObjectsFromYAMLManifest(wh)
 		if err != nil {
 			return err
@@ -510,20 +507,46 @@ func (h *HelmReconciler) analyzeWebhooks(whs []string) error {
 		if err != nil {
 			return err
 		}
-		whReaderSource := local.ReaderSource{
-			Name:   "",
-			Reader: strings.NewReader(objYaml),
+		// Here if we need to create a default tag, we need to skip the webhooks that are going to be deactivated.
+		if !DetectIfTagWebhookIsNeeded(h.iop, exists) {
+			whReaderSource := local.ReaderSource{
+				Name:   fmt.Sprintf("installed-webhook-%d", i),
+				Reader: strings.NewReader(objYaml),
+			}
+			localWebhookYAMLReaders = append(localWebhookYAMLReaders, whReaderSource)
 		}
-		localWebhookYAMLReaders = append(localWebhookYAMLReaders, whReaderSource)
 		parsedK8sObjects = append(parsedK8sObjects, k8sObjects...)
 	}
-	err := sa.AddReaderKubeSource(localWebhookYAMLReaders)
+
+	sa := local.NewSourceAnalyzer(analysis.Combine("webhook", &webhook.Analyzer{
+		SkipServiceCheck: true,
+	}), resource.Namespace(h.iop.Spec.GetNamespace()), resource.Namespace(istioV1Alpha1.Namespace(h.iop.Spec)), nil)
+
+	// Add in-cluster webhooks
+	objects := &unstructured.UnstructuredList{}
+	objects.SetGroupVersionKind(gvk.MutatingWebhookConfiguration.Kubernetes())
+	err := h.client.List(context.Background(), objects, &client.ListOptions{})
 	if err != nil {
 		return err
 	}
+	for i, obj := range objects.Items {
+		objYAML, err := object.NewK8sObject(&obj, nil, nil).YAML()
+		if err != nil {
+			return err
+		}
+		whReaderSource := local.ReaderSource{
+			Name:   fmt.Sprintf("in-cluster-webhook-%d", i),
+			Reader: strings.NewReader(string(objYAML)),
+		}
+		err = sa.AddReaderKubeSource([]local.ReaderSource{whReaderSource})
+		if err != nil {
+			return err
+		}
+	}
 
-	if h.kubeClient != nil {
-		sa.AddRunningKubeSource(h.kubeClient)
+	err = sa.AddReaderKubeSource(localWebhookYAMLReaders)
+	if err != nil {
+		return err
 	}
 
 	// Analyze webhooks
@@ -576,39 +599,44 @@ type ProcessDefaultWebhookOptions struct {
 	DryRun    bool
 }
 
-func ProcessDefaultWebhook(client kube.Client, iop *istioV1Alpha1.IstioOperator, exists bool, opt *ProcessDefaultWebhookOptions) (processed bool, err error) {
-	// Detect whether previous installation exists prior to performing the installation.
+func DetectIfTagWebhookIsNeeded(iop *istioV1Alpha1.IstioOperator, exists bool) bool {
 	rev := iop.Spec.Revision
 	isDefaultInstallation := rev == "" && iop.Spec.Components.Pilot != nil && iop.Spec.Components.Pilot.Enabled.Value
 	operatorManageWebhooks := operatorManageWebhooks(iop)
-	if !operatorManageWebhooks && (!exists || isDefaultInstallation) {
-		if rev == "" {
-			rev = revtag.DefaultRevisionName
-		}
-		autoInjectNamespaces := validateEnableNamespacesByDefault(iop)
+	return !operatorManageWebhooks && (!exists || isDefaultInstallation)
+}
 
-		ignorePruneLabel := map[string]string{
-			OwningResourceNotPruned: "true",
-		}
-
-		o := &revtag.GenerateOptions{
-			Tag:                  revtag.DefaultRevisionName,
-			Revision:             rev,
-			Overwrite:            true,
-			AutoInjectNamespaces: autoInjectNamespaces,
-			CustomLabels:         ignorePruneLabel,
-			Generate:             opt.DryRun,
-		}
-		// If tag cannot be created could be remote cluster install, don't fail out.
-		tagManifests, err := revtag.Generate(context.Background(), client, o, opt.Namespace)
-		if err == nil && !opt.DryRun {
-			if err = applyManifests(client, tagManifests); err != nil {
-				return false, err
-			}
-		}
-		processed = true
+func ProcessDefaultWebhook(client kube.Client, iop *istioV1Alpha1.IstioOperator, exists bool, opt *ProcessDefaultWebhookOptions) (processed bool, err error) {
+	// Detect whether previous installation exists prior to performing the installation.
+	if !DetectIfTagWebhookIsNeeded(iop, exists) {
+		return false, nil
 	}
-	return processed, nil
+	rev := iop.Spec.Revision
+	if rev == "" {
+		rev = revtag.DefaultRevisionName
+	}
+	autoInjectNamespaces := validateEnableNamespacesByDefault(iop)
+
+	ignorePruneLabel := map[string]string{
+		OwningResourceNotPruned: "true",
+	}
+
+	o := &revtag.GenerateOptions{
+		Tag:                  revtag.DefaultRevisionName,
+		Revision:             rev,
+		Overwrite:            true,
+		AutoInjectNamespaces: autoInjectNamespaces,
+		CustomLabels:         ignorePruneLabel,
+		Generate:             opt.DryRun,
+	}
+	// If tag cannot be created could be remote cluster install, don't fail out.
+	tagManifests, err := revtag.Generate(context.Background(), client, o, opt.Namespace)
+	if err == nil && !opt.DryRun {
+		if err = applyManifests(client, tagManifests); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func applyManifests(kubeClient kube.Client, manifests string) error {

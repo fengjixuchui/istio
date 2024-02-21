@@ -184,7 +184,7 @@ Istio currently supports both SotW and Delta protocol. However, the delta implem
 
 Istiod consists of a collection of controllers. Per Kubernetes, "controllers are control loops that watch the state of your cluster, then make or request changes where needed."
 
-In Istio, we use the term a bit more liberally. Istio controllers watch more than just the state of *a* cluster -- many are reading from multiple clusters, or even external sources (files and XDS). Generally Kubernetes controllers are then writing state back to the cluster; Istio does have a few of these controllers, but most of them are centered around driving the [Proxy Configuration](#proxy-configuration).
+In Istio, we use the term a bit more liberally. Istio controllers watch more than just the state of *a* cluster -- many are reading from multiple clusters, or even external sources (files and XDS). Generally, Kubernetes controllers are then writing state back to the cluster; Istio does have a few of these controllers, but most of them are centered around driving the [Proxy Configuration](#proxy-configuration).
 
 ### Writing controllers
 
@@ -272,7 +272,7 @@ In addition to this conversion, `Ingress` requires writing the address it can be
 
 #### Gateway
 
-Gateway (referring to the [Kubernetes API](http://gateway-api.org/), not the same-named Istio type) works very similarly to [Ingress](#ingress). The Gateway controller also coverts Gateway API types into `VirtualService` and `Gateway`, implementing the `ConfigStore` interface.
+Gateway (referring to the [Kubernetes API](http://gateway-api.org/), not the same-named Istio type) works very similarly to [Ingress](#ingress). The Gateway controller also converts Gateway API types into `VirtualService` and `Gateway`, implementing the `ConfigStore` interface.
 
 However, there is also a bit of additional logic. Gateway types have extensive status reporting. Unlike Ingress, this is status reporting is done inline in the main controller, allowing status generation to be done directly in the logic processing the resources.
 

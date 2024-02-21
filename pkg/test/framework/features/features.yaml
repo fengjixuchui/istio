@@ -161,6 +161,7 @@ features:
       uninstall_revision:
       uninstall_manifest:
       uninstall_purge:
+      uninstall_file:
       postinstall_verify:
       revision_centric_view:
       revision_tags:
@@ -177,6 +178,9 @@ features:
         upgrade:
       firstpartyjwt:
         install:
+      ambient:
+        install:
+        upgrade:
     upgrade:
   # describes internal build and testing infrastructure
   infrastructure:

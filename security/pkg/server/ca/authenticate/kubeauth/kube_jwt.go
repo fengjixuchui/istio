@@ -15,11 +15,11 @@
 package kubeauth
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/metadata"
 	"k8s.io/client-go/kubernetes"
 
@@ -109,7 +109,7 @@ func (a *KubeJWTAuthenticator) authenticateGrpc(ctx context.Context) (*security.
 	if err != nil {
 		return nil, fmt.Errorf("target JWT extraction error: %v", err)
 	}
-	clusterID := extractClusterID(ctx)
+	clusterID := ExtractClusterID(ctx)
 
 	return a.authenticate(targetJWT, clusterID)
 }
@@ -186,7 +186,7 @@ func (a *KubeJWTAuthenticator) getKubeClient(clusterID cluster.ID) kubernetes.In
 	return nil
 }
 
-func extractClusterID(ctx context.Context) cluster.ID {
+func ExtractClusterID(ctx context.Context) cluster.ID {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ""

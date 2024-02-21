@@ -28,12 +28,6 @@ import (
 	"istio.io/istio/pkg/util/sets"
 )
 
-// newKubeClient is a unit test override variable for interface create.
-var newKubeClient = newK8sClient
-
-// getKubePodInfo is a unit test override variable for interface create.
-var getKubePodInfo = getK8sPodInfo
-
 type PodInfo struct {
 	Containers        sets.String
 	Labels            map[string]string
@@ -45,7 +39,7 @@ type PodInfo struct {
 }
 
 // newK8sClient returns a Kubernetes client
-func newK8sClient(conf Config) (*kubernetes.Clientset, error) {
+func newK8sClient(conf Config) (kubernetes.Interface, error) {
 	// Some config can be passed in a kubeconfig file
 	kubeconfig := conf.Kubernetes.Kubeconfig
 
@@ -57,17 +51,24 @@ func newK8sClient(conf Config) (*kubernetes.Clientset, error) {
 
 	log.Debugf("istio-cni set up kubernetes client with kubeconfig %s", kubeconfig)
 
-	// Create the clientset
+	// Create the client
 	return kubernetes.NewForConfig(config)
 }
 
 // getK8sPodInfo returns information of a POD
-func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (*PodInfo, error) {
+func getK8sPodInfo(client kubernetes.Interface, podName, podNamespace string) (*PodInfo, error) {
 	pod, err := client.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 
+	pi := ExtractPodInfo(pod)
+	log.Debugf("Pod %v/%v info: \n%+v", podNamespace, podName, pi)
+
+	return pi, nil
+}
+
+func ExtractPodInfo(pod *v1.Pod) *PodInfo {
 	pi := &PodInfo{
 		Containers:        sets.New[string](),
 		Labels:            pod.Labels,
@@ -91,9 +92,7 @@ func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (
 			}
 		}
 	}
-	log.Debugf("Pod %v/%v info: \n%+v", podNamespace, podName, pi)
-
-	return pi, nil
+	return pi
 }
 
 // containers fetches all containers in the pod.

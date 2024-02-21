@@ -51,7 +51,9 @@ import (
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/visibility"
 	"istio.io/istio/pkg/config/xds"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/proto"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
@@ -105,6 +107,80 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
 						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
 							DefaultValidationContext: &auth.CertificateValidationContext{},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "ROOTCA",
+								SdsConfig: &core.ConfigSource{
+									InitialFetchTimeout: durationpb.New(time.Second * 0),
+									ResourceApiVersion:  core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
+			name: "mesh SDS enabled, tls mode ISTIO_MUTUAL, CRL specified",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:  networking.ServerTLSSettings_ISTIO_MUTUAL,
+					CaCrl: "/custom/path/to/crl.pem",
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "default",
+							SdsConfig: &core.ConfigSource{
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+								ResourceApiVersion:  core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								Crl: &core.DataSource{
+									Specifier: &core.DataSource_Filename{
+										Filename: "/custom/path/to/crl.pem",
+									},
+								},
+							},
 							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
 								Name: "ROOTCA",
 								SdsConfig: &core.ConfigSource{
@@ -481,6 +557,83 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
+			name: "no credential name key and cert subject alt names tls MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:              networking.ServerTLSSettings_MUTUAL,
+					ServerCertificate: "server-cert.crt",
+					PrivateKey:        "private-key.key",
+					CaCertificates:    "ca-cert.crt",
+					SubjectAltNames:   []string{"subject.name.a.com", "subject.name.b.com"},
+					CaCrl:             "/custom/path/to/crl.pem",
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+								Crl: &core.DataSource{
+									Specifier: &core.DataSource_Filename{
+										Filename: "/custom/path/to/crl.pem",
+									},
+								},
+							},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "file-root:ca-cert.crt",
+								SdsConfig: &core.ConfigSource{
+									ResourceApiVersion: core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
 			name: "no credential name key and cert subject alt names tls OPTIONAL_MUTUAL",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
@@ -524,6 +677,83 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
 							DefaultValidationContext: &auth.CertificateValidationContext{
 								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+							},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "file-root:ca-cert.crt",
+								SdsConfig: &core.ConfigSource{
+									ResourceApiVersion: core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
+		{
+			name: "no credential name key and cert subject alt names tls OPTIONAL_MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:              networking.ServerTLSSettings_OPTIONAL_MUTUAL,
+					ServerCertificate: "server-cert.crt",
+					PrivateKey:        "private-key.key",
+					CaCertificates:    "ca-cert.crt",
+					CaCrl:             "/custom/path/to/crl.pem",
+					SubjectAltNames:   []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+								Crl: &core.DataSource{
+									Specifier: &core.DataSource_Filename{
+										Filename: "/custom/path/to/crl.pem",
+									},
+								},
 							},
 							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
 								Name: "file-root:ca-cert.crt",
@@ -2050,6 +2280,7 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 		expectedVirtualHostsHostPortStrip map[string][]string
 		expectedHTTPRoutes                map[string]int
 		redirect                          bool
+		expectStatefulSession             bool
 	}{
 		{
 			name:            "404 when no services",
@@ -2066,7 +2297,8 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 					"*",
 				},
 			},
-			expectedHTTPRoutes: map[string]int{"blackhole:80": 0},
+			expectedHTTPRoutes:    map[string]int{"blackhole:80": 0},
+			expectStatefulSession: false,
 		},
 		{
 			name:            "tls redirect without virtual services",
@@ -2082,8 +2314,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 				"example.org:80": {"example.org"},
 			},
 			// We will setup a VHost which just redirects; no routes
-			expectedHTTPRoutes: map[string]int{"example.org:80": 0},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 0},
+			redirect:              true,
+			expectStatefulSession: false,
 		},
 		{
 			name:            "virtual services with tls redirect",
@@ -2098,8 +2331,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:80": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:80": 1},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 1},
+			redirect:              true,
+			expectStatefulSession: true,
 		},
 		{
 			name:            "merging of virtual services when tls redirect is set",
@@ -2114,8 +2348,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:80": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:80": 4},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 4},
+			redirect:              true,
+			expectStatefulSession: true,
 		},
 		{
 			name:            "reverse merging of virtual services when tls redirect is set",
@@ -2130,8 +2365,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:80": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:80": 4},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 4},
+			redirect:              true,
+			expectStatefulSession: true,
 		},
 		{
 			name:            "merging of virtual services when tls redirect is set without VS",
@@ -2146,8 +2382,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:80": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:80": 2},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 2},
+			redirect:              true,
+			expectStatefulSession: true,
 		},
 		{
 			name:            "reverse merging of virtual services when tls redirect is set without VS",
@@ -2162,8 +2399,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:80": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:80": 2},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 2},
+			redirect:              true,
+			expectStatefulSession: false,
 		},
 		{
 			name:            "add a route for a virtual service",
@@ -2221,7 +2459,8 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"*.org:80": {"*.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"*.org:80": 1},
+			expectedHTTPRoutes:    map[string]int{"*.org:80": 1},
+			expectStatefulSession: false,
 		},
 		{
 			name:            "http redirection not working when virtualservice not match http port",
@@ -2234,7 +2473,8 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:443": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:443": 1},
+			expectedHTTPRoutes:    map[string]int{"example.org:443": 1},
+			expectStatefulSession: false,
 		},
 		{
 			name:            "http redirection not working when virtualservice not match http port",
@@ -2248,8 +2488,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 				"example.org:80": {"example.org"},
 			},
 			// We will setup a VHost which just redirects; no routes
-			expectedHTTPRoutes: map[string]int{"example.org:80": 0},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 0},
+			redirect:              true,
+			expectStatefulSession: false,
 		},
 		{
 			name:            "http & https redirection not working when virtualservice not match http port",
@@ -2262,8 +2503,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			expectedVirtualHostsHostPortStrip: map[string][]string{
 				"example.org:443": {"example.org"},
 			},
-			expectedHTTPRoutes: map[string]int{"example.org:443": 1},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:443": 1},
+			redirect:              true,
+			expectStatefulSession: false,
 		},
 		{
 			name:            "http & https redirection not working when virtualservice not match http port",
@@ -2277,8 +2519,21 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 				"example.org:80": {"example.org"},
 			},
 			// We will setup a VHost which just redirects; no routes
-			expectedHTTPRoutes: map[string]int{"example.org:80": 0},
-			redirect:           true,
+			expectedHTTPRoutes:    map[string]int{"example.org:80": 0},
+			redirect:              true,
+			expectStatefulSession: false,
+		},
+	}
+	exampleService := &pilot_model.Service{
+		Hostname: host.Name("example.org"),
+		Ports: []*pilot_model.Port{{
+			Name:     "http",
+			Protocol: "HTTP",
+			Port:     80,
+		}},
+		Attributes: pilot_model.ServiceAttributes{
+			Namespace: "default",
+			Labels:    map[string]string{"istio.io/persistent-session": "session-cookie"},
 		},
 	}
 
@@ -2288,6 +2543,9 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			cfgs = append(cfgs, tt.virtualServices...)
 			cg := NewConfigGenTest(t, TestOptions{
 				Configs: cfgs,
+				Services: []*pilot_model.Service{
+					exampleService,
+				},
 			})
 			r := cg.ConfigGen.buildGatewayHTTPRouteConfig(cg.SetupProxy(&proxyGateway), cg.PushContext(), tt.routeName)
 			if r == nil {
@@ -2308,12 +2566,15 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 				if tt.redirect != (h.RequireTls == route.VirtualHost_ALL) {
 					t.Errorf("expected redirect %v, got %v", tt.redirect, h.RequireTls)
 				}
+				if tt.expectStatefulSession && h.TypedPerFilterConfig[util.StatefulSessionFilter] == nil {
+					t.Errorf("expected per filter config for stateful session filter, but not found")
+				}
 			}
 
-			if !reflect.DeepEqual(tt.expectedVirtualHosts, vh) {
+			if !maps.EqualFunc(tt.expectedVirtualHosts, vh, slices.Equal) {
 				t.Errorf("got unexpected virtual hosts. Expected: %v, Got: %v", tt.expectedVirtualHosts, vh)
 			}
-			if !reflect.DeepEqual(tt.expectedHTTPRoutes, hr) {
+			if !maps.Equal(tt.expectedHTTPRoutes, hr) {
 				t.Errorf("got unexpected number of http routes. Expected: %v, Got: %v", tt.expectedHTTPRoutes, hr)
 			}
 		})
@@ -3724,10 +3985,10 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.RoleBasedAccessControl,
 							wellknown.ExternalAuthorization,
-							"istio-system.wasm-authn",
-							"istio-system.wasm-authz",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
 							wellknown.RoleBasedAccessControl,
-							"istio-system.wasm-stats",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
 							xds.StatsFilterName,
 							wellknown.TCPProxy,
 						},
@@ -3830,9 +4091,9 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					{
 						TotalMatch: true,
 						NetworkFilters: []string{
-							"istio-system.wasm-network-authn",
-							"istio-system.wasm-network-authz",
-							"istio-system.wasm-network-stats",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
 							wellknown.HTTPConnectionManager,
 						},
 						HTTPFilters: []string{
@@ -3840,10 +4101,10 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.HTTPRoleBasedAccessControl,
 							wellknown.HTTPExternalAuthorization,
-							"istio-system.wasm-authn",
-							"istio-system.wasm-authz",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
 							wellknown.HTTPRoleBasedAccessControl,
-							"istio-system.wasm-stats",
+							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
 							wellknown.HTTPGRPCStats,
 							xdsfilters.Alpn.Name,
 							xdsfilters.Fault.Name,

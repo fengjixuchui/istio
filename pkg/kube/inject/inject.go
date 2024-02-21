@@ -45,6 +45,7 @@ import (
 	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
@@ -96,17 +97,18 @@ const (
 // SidecarTemplateData is the data object to which the templated
 // version of `SidecarInjectionSpec` is applied.
 type SidecarTemplateData struct {
-	TypeMeta       metav1.TypeMeta
-	DeploymentMeta metav1.ObjectMeta
-	ObjectMeta     metav1.ObjectMeta
-	Spec           corev1.PodSpec
-	ProxyConfig    *meshconfig.ProxyConfig
-	MeshConfig     *meshconfig.MeshConfig
-	Values         map[string]any
-	Revision       string
-	ProxyImage     string
-	ProxyUID       int64
-	ProxyGID       int64
+	TypeMeta                 metav1.TypeMeta
+	DeploymentMeta           metav1.ObjectMeta
+	ObjectMeta               metav1.ObjectMeta
+	Spec                     corev1.PodSpec
+	ProxyConfig              *meshconfig.ProxyConfig
+	MeshConfig               *meshconfig.MeshConfig
+	Values                   map[string]any
+	Revision                 string
+	ProxyImage               string
+	ProxyUID                 int64
+	ProxyGID                 int64
+	InboundTrafficPolicyMode string
 }
 
 type (
@@ -326,6 +328,16 @@ func ProxyImage(values *opconfig.Values, image *proxyConfig.ProxyImage, annotati
 	return imageURL(global.GetHub(), imageName, tag, imageType)
 }
 
+func InboundTrafficPolicyMode(meshConfig *meshconfig.MeshConfig) string {
+	switch meshConfig.GetInboundTrafficPolicy().GetMode() {
+	case meshconfig.MeshConfig_InboundTrafficPolicy_LOCALHOST:
+		return "localhost"
+	case meshconfig.MeshConfig_InboundTrafficPolicy_PASSTHROUGH:
+		return "passthrough"
+	}
+	return "passthrough"
+}
+
 // imageURL creates url from parts.
 // imageType is appended if not empty
 // if imageType is already present in the tag, then it is replaced.
@@ -400,17 +412,18 @@ func RunTemplate(params InjectionParameters) (mergedPod *corev1.Pod, templatePod
 	proxyUID, proxyGID := GetProxyIDs(params.namespace)
 
 	data := SidecarTemplateData{
-		TypeMeta:       params.typeMeta,
-		DeploymentMeta: params.deployMeta,
-		ObjectMeta:     strippedPod.ObjectMeta,
-		Spec:           strippedPod.Spec,
-		ProxyConfig:    params.proxyConfig,
-		MeshConfig:     meshConfig,
-		Values:         params.valuesConfig.asMap,
-		Revision:       params.revision,
-		ProxyImage:     ProxyImage(params.valuesConfig.asStruct, params.proxyConfig.Image, strippedPod.Annotations),
-		ProxyUID:       proxyUID,
-		ProxyGID:       proxyGID,
+		TypeMeta:                 params.typeMeta,
+		DeploymentMeta:           params.deployMeta,
+		ObjectMeta:               strippedPod.ObjectMeta,
+		Spec:                     strippedPod.Spec,
+		ProxyConfig:              params.proxyConfig,
+		MeshConfig:               meshConfig,
+		Values:                   params.valuesConfig.asMap,
+		Revision:                 params.revision,
+		ProxyImage:               ProxyImage(params.valuesConfig.asStruct, params.proxyConfig.Image, strippedPod.Annotations),
+		ProxyUID:                 proxyUID,
+		ProxyGID:                 proxyGID,
+		InboundTrafficPolicyMode: InboundTrafficPolicyMode(meshConfig),
 	}
 
 	mergedPod = params.pod
@@ -661,9 +674,9 @@ func IntoObject(injector Injector, sidecarTemplate Templates, valuesConfig Value
 		podSpec = &job.Spec.JobTemplate.Spec.Template.Spec
 	case *corev1.Pod:
 		pod := v
-		typeMeta = pod.TypeMeta
 		metadata = &pod.ObjectMeta
-		deploymentMetadata = pod.ObjectMeta
+		// sync from webhook inject
+		deploymentMetadata, typeMeta = kube.GetDeployMetaFromPod(pod)
 		podSpec = &pod.Spec
 	case *appsv1.Deployment: // Added to be explicit about the most expected case
 		deploy := v

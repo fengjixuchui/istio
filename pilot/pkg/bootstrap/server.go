@@ -36,12 +36,14 @@ import (
 	"google.golang.org/grpc/reflection"
 	"k8s.io/client-go/rest"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/api/security/v1beta1"
 	kubecredentials "istio.io/istio/pilot/pkg/credentials/kube"
 	"istio.io/istio/pilot/pkg/features"
 	istiogrpc "istio.io/istio/pilot/pkg/grpc"
 	"istio.io/istio/pilot/pkg/keycertbundle"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
 	"istio.io/istio/pilot/pkg/server"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
@@ -71,6 +73,7 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/ra"
+	caserver "istio.io/istio/security/pkg/server/ca"
 	"istio.io/istio/security/pkg/server/ca/authenticate"
 	"istio.io/istio/security/pkg/server/ca/authenticate/kubeauth"
 )
@@ -135,8 +138,9 @@ type Server struct {
 	cacertsWatcher *fsnotify.Watcher
 	dnsNames       []string
 
-	CA *ca.IstioCA
-	RA ra.RegistrationAuthority
+	CA       *ca.IstioCA
+	RA       ra.RegistrationAuthority
+	caServer *caserver.Server
 
 	// TrustAnchors for workload to workload mTLS
 	workloadTrustBundle     *tb.TrustBundle
@@ -238,6 +242,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	// Initialize workload Trust Bundle before XDS Server
 	e.TrustBundle = s.workloadTrustBundle
 	s.XDSServer = xds.NewDiscoveryServer(e, args.RegistryOptions.KubeOptions.ClusterAliases)
+	configGen := v1alpha3.NewConfigGenerator(s.XDSServer.Cache)
 
 	grpcprom.EnableHandlingTimeHistogram()
 
@@ -261,7 +266,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	spiffe.SetTrustDomain(s.environment.Mesh().GetTrustDomain())
 
 	s.initMeshNetworks(args, s.fileWatcher)
-	s.initMeshHandlers()
+	s.initMeshHandlers(configGen.MeshConfigChanged)
 	s.environment.Init()
 	if err := s.environment.InitNetworksManager(s.XDSServer); err != nil {
 		return nil, err
@@ -289,7 +294,7 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		return nil, err
 	}
 
-	s.XDSServer.InitGenerators(e, args.Namespace, s.clusterID, s.internalDebugMux)
+	InitGenerators(s.XDSServer, configGen, args.Namespace, s.clusterID, s.internalDebugMux)
 
 	// Initialize workloadTrustBundle after CA has been initialized
 	if err := s.initWorkloadTrustBundle(args); err != nil {
@@ -947,7 +952,6 @@ func (s *Server) initIstiodCerts(args *PilotArgs, host string) error {
 			KeyFile:    tlsKeyPath,
 			CertFile:   tlsCertPath,
 		})
-
 		if err != nil {
 			// Not crashing istiod - This typically happens if certs are missing and in tests.
 			log.Errorf("error initializing certificate watches: %v", err)
@@ -1177,30 +1181,32 @@ func (s *Server) startCA(caOpts *caOptions) {
 	if s.CA == nil && s.RA == nil {
 		return
 	}
+	// init the RA server if configured, else start init CA server
+	if s.RA != nil {
+		log.Infof("initializing CA server with RA")
+		s.initCAServer(s.RA, caOpts)
+	} else if s.CA != nil {
+		log.Infof("initializing CA server with IstioD CA")
+		s.initCAServer(s.CA, caOpts)
+	}
 	s.addStartFunc("ca", func(stop <-chan struct{}) error {
 		grpcServer := s.secureGrpcServer
 		if s.secureGrpcServer == nil {
 			grpcServer = s.grpcServer
 		}
-		// Start the RA server if configured, else start the CA server
-		if s.RA != nil {
-			log.Infof("Starting RA")
-			s.RunCA(grpcServer, s.RA, caOpts)
-		} else if s.CA != nil {
-			log.Infof("Starting IstioD CA")
-			s.RunCA(grpcServer, s.CA, caOpts)
-		}
+		log.Infof("starting CA server")
+		s.RunCA(grpcServer)
 		return nil
 	})
 }
 
 // initMeshHandlers initializes mesh and network handlers.
-func (s *Server) initMeshHandlers() {
+func (s *Server) initMeshHandlers(changeHandler func(_ *meshconfig.MeshConfig)) {
 	log.Info("initializing mesh handlers")
 	// When the mesh config or networks change, do a full push.
 	s.environment.AddMeshHandler(func() {
 		spiffe.SetTrustDomain(s.environment.Mesh().GetTrustDomain())
-		s.XDSServer.ConfigGenerator.MeshConfigChanged(s.environment.Mesh())
+		changeHandler(s.environment.Mesh())
 		s.XDSServer.ConfigUpdate(&model.PushRequest{
 			Full:   true,
 			Reason: model.NewReasonStats(model.GlobalUpdate),

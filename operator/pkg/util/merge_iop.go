@@ -140,6 +140,7 @@ type meshConfig struct {
 	EnableAutoMtls                 *wrappers.BoolValue                                       `json:"enableAutoMtls" patchStrategy:"replace"`
 	EnablePrometheusMerge          *wrappers.BoolValue                                       `json:"enablePrometheusMerge" patchStrategy:"replace"`
 	OutboundTrafficPolicy          *v1alpha13.MeshConfig_OutboundTrafficPolicy               `json:"outboundTrafficPolicy" patchStrategy:"merge"`
+	InboundTrafficPolicy           *v1alpha13.MeshConfig_InboundTrafficPolicy                `json:"inboundTrafficPolicy" patchStrategy:"merge"`
 	TCPKeepalive                   *v1alpha3.ConnectionPoolSettings_TCPSettings_TcpKeepalive `json:"tcpKeepalive" patchStrategy:"merge"`
 	DefaultConfig                  *proxyConfig                                              `json:"defaultConfig" patchStrategy:"merge"`
 	ConfigSources                  []*v1alpha13.ConfigSource                                 `json:"configSources" patchStrategy:"merge" patchMergeKey:"address"`
@@ -222,10 +223,8 @@ type telemetryConfig struct {
 }
 
 type telemetryV2Config struct {
-	MetadataExchange *v1alpha12.TelemetryV2MetadataExchangeConfig      `json:"metadataExchange" patchStrategy:"merge"`
-	Prometheus       *v1alpha12.TelemetryV2PrometheusConfig            `json:"prometheus" patchStrategy:"merge"`
-	Stackdriver      *v1alpha12.TelemetryV2StackDriverConfig           `json:"stackdriver" patchStrategy:"merge"`
-	AccessLogPolicy  *v1alpha12.TelemetryV2AccessLogPolicyFilterConfig `json:"accessLogPolicy" patchStrategy:"merge"`
+	Prometheus  *v1alpha12.TelemetryV2PrometheusConfig  `json:"prometheus" patchStrategy:"merge"`
+	Stackdriver *v1alpha12.TelemetryV2StackDriverConfig `json:"stackdriver" patchStrategy:"merge"`
 }
 
 var iopMergeStruct iopMergeStructType

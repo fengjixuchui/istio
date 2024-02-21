@@ -351,19 +351,6 @@ func ValidateHTTPHeaderWithAuthorityOperationName(name string) error {
 	return nil
 }
 
-// ValidateHTTPHeaderWithHostOperationName validates a header name when used to destination specific add/set in request.
-// TODO(https://github.com/envoyproxy/envoy/issues/16775) merge with ValidateHTTPHeaderWithAuthorityOperationName
-func ValidateHTTPHeaderWithHostOperationName(name string) error {
-	if name == "" {
-		return fmt.Errorf("header name cannot be empty")
-	}
-	// Authority header is validated later
-	if isInternalHeader(name) && !strings.EqualFold(name, "host") {
-		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
-	}
-	return nil
-}
-
 // ValidateHTTPHeaderOperationName validates a header name when used to remove from request or modify response.
 func ValidateHTTPHeaderOperationName(name string) error {
 	if name == "" {
@@ -666,6 +653,14 @@ func validateTLSOptions(tls *networking.ServerTLSSettings) (v Validation) {
 		}
 		if tls.CaCertificates == "" {
 			v = appendValidation(v, fmt.Errorf("MUTUAL TLS requires a client CA bundle"))
+		}
+	}
+	if tls.CaCrl != "" {
+		if tls.CredentialName != "" {
+			v = appendValidation(v, fmt.Errorf("CRL is not supported with credentialName. CRL has to be specified in the credential"))
+		}
+		if tls.Mode == networking.ServerTLSSettings_SIMPLE {
+			v = appendValidation(v, fmt.Errorf("CRL is not supported with SIMPLE TLS"))
 		}
 	}
 	return
@@ -1472,6 +1467,9 @@ func validateConnectionPool(settings *networking.ConnectionPoolSettings) (errs e
 		if httpSettings.H2UpgradePolicy == networking.ConnectionPoolSettings_HTTPSettings_UPGRADE && httpSettings.UseClientProtocol {
 			errs = appendErrors(errs, fmt.Errorf("use client protocol must not be true when H2UpgradePolicy is UPGRADE"))
 		}
+		if httpSettings.MaxConcurrentStreams < 0 {
+			errs = appendErrors(errs, fmt.Errorf("max concurrent streams must be non-negative"))
+		}
 	}
 
 	if tcp := settings.Tcp; tcp != nil {
@@ -1827,14 +1825,14 @@ func validateServiceSettings(config *meshconfig.MeshConfig) (errs error) {
 func validatePrivateKeyProvider(pkpConf *meshconfig.PrivateKeyProvider) error {
 	var errs error
 	if pkpConf.GetProvider() == nil {
-		errs = multierror.Append(errs, errors.New("private key provider confguration is required"))
+		errs = multierror.Append(errs, errors.New("private key provider configuration is required"))
 	}
 
 	switch pkpConf.GetProvider().(type) {
 	case *meshconfig.PrivateKeyProvider_Cryptomb:
 		cryptomb := pkpConf.GetCryptomb()
 		if cryptomb == nil {
-			errs = multierror.Append(errs, errors.New("cryptomb confguration is required"))
+			errs = multierror.Append(errs, errors.New("cryptomb configuration is required"))
 		} else {
 			pollDelay := cryptomb.GetPollDelay()
 			if pollDelay == nil {
@@ -1846,7 +1844,7 @@ func validatePrivateKeyProvider(pkpConf *meshconfig.PrivateKeyProvider) error {
 	case *meshconfig.PrivateKeyProvider_Qat:
 		qatConf := pkpConf.GetQat()
 		if qatConf == nil {
-			errs = multierror.Append(errs, errors.New("qat confguration is required"))
+			errs = multierror.Append(errs, errors.New("qat configuration is required"))
 		} else {
 			pollDelay := qatConf.GetPollDelay()
 			if pollDelay == nil {
@@ -1967,7 +1965,7 @@ func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) (errs error) 
 
 	if pkpConf := config.GetPrivateKeyProvider(); pkpConf != nil {
 		if err := validatePrivateKeyProvider(pkpConf); err != nil {
-			errs = multierror.Append(errs, multierror.Prefix(err, "invalid private key provider confguration:"))
+			errs = multierror.Append(errs, multierror.Prefix(err, "invalid private key provider configuration:"))
 		}
 	}
 
@@ -2949,11 +2947,11 @@ func validateHTTPRouteDestinations(weights []*networking.HTTPRouteDestination, g
 
 		// header manipulations
 		for name, val := range weight.Headers.GetRequest().GetAdd() {
-			errs = appendErrors(errs, ValidateHTTPHeaderWithHostOperationName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderWithAuthorityOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for name, val := range weight.Headers.GetRequest().GetSet() {
-			errs = appendErrors(errs, ValidateHTTPHeaderWithHostOperationName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderWithAuthorityOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for _, name := range weight.Headers.GetRequest().GetRemove() {
@@ -3532,6 +3530,9 @@ var ValidateServiceEntry = registerValidateFunc("ValidateServiceEntry",
 			if len(serviceEntry.Endpoints) != 0 {
 				errs = appendValidation(errs, fmt.Errorf("no endpoints should be provided for resolution type none"))
 			}
+			if serviceEntry.WorkloadSelector != nil {
+				errs = appendWarningf(errs, "workloadSelector should not be set when resolution mode is NONE")
+			}
 		case networking.ServiceEntry_STATIC:
 			for _, endpoint := range serviceEntry.Endpoints {
 				if endpoint == nil {
@@ -3576,6 +3577,11 @@ var ValidateServiceEntry = registerValidateFunc("ValidateServiceEntry",
 						ValidatePort(int(port)))
 				}
 			}
+
+			if serviceEntry.WorkloadSelector != nil {
+				errs = appendWarningf(errs, "workloadSelector should not be set when resolution mode is %v", serviceEntry.Resolution)
+			}
+
 			if len(serviceEntry.Addresses) > 0 {
 				for _, port := range serviceEntry.Ports {
 					if port == nil {

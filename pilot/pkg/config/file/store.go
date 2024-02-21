@@ -40,7 +40,7 @@ import (
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config"
-	kube2 "istio.io/istio/pkg/config/legacy/source/kube"
+	legacykube "istio.io/istio/pkg/config/analysis/legacy/source/kube"
 	"istio.io/istio/pkg/config/resource"
 	"istio.io/istio/pkg/config/schema/collection"
 	sresource "istio.io/istio/pkg/config/schema/resource"
@@ -64,9 +64,8 @@ type KubeSource struct {
 	inner     model.ConfigStore
 	defaultNs resource.Namespace
 
-	versionCtr int64
-	shas       map[kubeResourceKey]resourceSha
-	byFile     map[string]map[kubeResourceKey]config.GroupVersionKind
+	shas   map[kubeResourceKey]resourceSha
+	byFile map[string]map[kubeResourceKey]config.GroupVersionKind
 
 	// If meshConfig.DiscoverySelectors are specified, the namespacesFilter tracks the namespaces this controller watches.
 	namespacesFilter func(obj interface{}) bool
@@ -175,7 +174,6 @@ func (s *KubeSource) SetNamespacesFilter(namespacesFilter func(obj interface{}) 
 
 // Clear the contents of this source
 func (s *KubeSource) Clear() {
-	s.versionCtr = 0
 	s.shas = make(map[kubeResourceKey]resourceSha)
 	s.byFile = make(map[string]map[kubeResourceKey]config.GroupVersionKind)
 	s.inner = memory.MakeSkipValidation(*s.schemas)
@@ -213,8 +211,6 @@ func (s *KubeSource) ApplyContent(name, yamlText string) error {
 
 		oldSha, found := s.shas[key]
 		if !found || oldSha != r.sha {
-			s.versionCtr++
-			r.config.ResourceVersion = fmt.Sprintf("v%d", s.versionCtr)
 			scope.Debugf("KubeSource.ApplyContent: Set: %v/%v", r.schema.GroupVersionKind(), r.fullName())
 			// apply is idempotent, but configstore is not, thus the odd logic here
 			_, err := s.inner.Update(*r.config)
@@ -333,6 +329,11 @@ func (s *KubeSource) parseChunk(r *collection.Schemas, name string, lineNum int,
 		return resources, fmt.Errorf("failed converting YAML to JSON: %v", err)
 	}
 
+	// ignore null json
+	if len(jsonChunk) == 0 || bytes.Equal(jsonChunk, []byte("null")) {
+		return resources, nil
+	}
+
 	// Peek at the beginning of the JSON to
 	groupVersionKind, err := kubeJson.DefaultMetaFactory.Interpret(jsonChunk)
 	if err != nil {
@@ -425,7 +426,7 @@ func (s *KubeSource) parseChunk(r *collection.Schemas, name string, lineNum int,
 		BuildFieldPathMap(yamlNode, lineNum, "", fieldMap)
 	}
 
-	pos := kube2.Position{Filename: name, Line: lineNum}
+	pos := legacykube.Position{Filename: name, Line: lineNum}
 	c, err := ToConfig(objMeta, schema, &pos, fieldMap)
 	if err != nil {
 		return resources, err

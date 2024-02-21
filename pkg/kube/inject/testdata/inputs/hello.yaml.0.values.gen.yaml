@@ -6,7 +6,6 @@
     "certSigners": [],
     "configCluster": false,
     "configValidation": true,
-    "defaultNodeSelector": {},
     "defaultPodDisruptionBudget": {
       "enabled": true
     },
@@ -90,18 +89,17 @@
       "servicePort": 0
     },
     "tag": "latest",
-    "tracer": {
-      "datadog": {},
-      "lightstep": {},
-      "stackdriver": {},
-      "zipkin": {}
-    },
-    "useMCP": false,
     "variant": ""
   },
   "istio_cni": {
     "chained": true,
     "enabled": true
+  },
+  "pilot": {
+    "cni": {
+      "chained": true,
+      "enabled": false
+    }
   },
   "revision": "",
   "sidecarInjectorWebhook": {

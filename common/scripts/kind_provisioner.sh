@@ -172,14 +172,15 @@ function setup_kind_cluster() {
   if [[ -z "${CONFIG}" ]]; then
     # Kubernetes 1.15+
     CONFIG=${DEFAULT_CLUSTER_YAML}
-    # Configure the cluster IP Family only for default configs
-    if [ "${IP_FAMILY}" != "ipv4" ]; then
-      grep "ipFamily: ${IP_FAMILY}" "${CONFIG}" || \
-      cat <<EOF >> "${CONFIG}"
+  fi
+
+  # Configure the cluster IP Family if explicitly set
+  if [ "${IP_FAMILY}" != "ipv4" ]; then
+    grep "ipFamily: ${IP_FAMILY}" "${CONFIG}" || \
+    cat <<EOF >> "${CONFIG}"
 networking:
   ipFamily: ${IP_FAMILY}
 EOF
-    fi
   fi
 
   KIND_WAIT_FLAG="--wait=180s"
@@ -196,7 +197,7 @@ EOF
     return 9
   fi
   # Workaround kind issue causing taints to not be removed in 1.24
-  kubectl taint nodes "${NAME}"-control-plane node-role.kubernetes.io/control-plane- || true
+  kubectl taint nodes "${NAME}"-control-plane node-role.kubernetes.io/control-plane- 2>/dev/null || true
 
   # Determine what CNI to install
   case "${KUBERNETES_CNI:-}" in 
@@ -403,7 +404,7 @@ function install_calico {
 function install_metallb() {
   KUBECONFIG="${1}"
   kubectl --kubeconfig="$KUBECONFIG" apply -f "${COMMON_SCRIPTS}/metallb-native.yaml"
-  kubectl --kubeconfig="$KUBECONFIG" wait -n metallb-system pod -l app=metallb --for=condition=Ready
+  kubectl --kubeconfig="$KUBECONFIG" wait -n metallb-system pod --timeout=120s -l app=metallb --for=condition=Ready
 
   if [ -z "${METALLB_IPS4+x}" ]; then
     # Take IPs from the end of the docker kind network subnet to use for MetalLB IPs

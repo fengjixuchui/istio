@@ -53,6 +53,7 @@ import (
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -335,6 +336,7 @@ func TestEnvoyFilterOrder(t *testing.T) {
 		{
 			Meta: config.Meta{Name: "a-medium-priority", Namespace: "testns-1", GroupVersionKind: gvk.EnvoyFilter, CreationTimestamp: ctime},
 			Spec: &networking.EnvoyFilter{
+				Priority: 10,
 				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 					{
 						Patch: &networking.EnvoyFilter_Patch{},
@@ -462,6 +464,85 @@ func TestEnvoyFilterOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(expectedns1, gotns1) {
 		t.Errorf("Envoy filters are not ordered as expected. expected: %v got: %v", expectedns1, gotns1)
+	}
+}
+
+func buildPatchStruct(config string) *structpb.Struct {
+	val := &structpb.Struct{}
+	_ = protomarshal.UnmarshalString(config, val)
+	return val
+}
+
+func TestEnvoyFilterOrderAcrossNamespaces(t *testing.T) {
+	env := &Environment{}
+	store := NewFakeStore()
+
+	proxy := &Proxy{
+		Metadata:        &NodeMetadata{IstioVersion: "foobar"},
+		Labels:          map[string]string{"app": "v1"},
+		ConfigNamespace: "test-ns",
+	}
+
+	envoyFilters := []config.Config{
+		{
+			Meta: config.Meta{Name: "filter-1", Namespace: "test-ns", GroupVersionKind: gvk.EnvoyFilter},
+			Spec: &networking.EnvoyFilter{
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+					{
+						ApplyTo: networking.EnvoyFilter_HTTP_FILTER,
+						Patch: &networking.EnvoyFilter_Patch{
+							Operation: networking.EnvoyFilter_Patch_INSERT_BEFORE,
+							Value:     buildPatchStruct(`{"name": "filter-1"}`),
+						},
+						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+							Proxy: &networking.EnvoyFilter_ProxyMatch{ProxyVersion: `foobar`},
+						},
+					},
+				},
+				Priority: -5,
+			},
+		},
+		{
+			Meta: config.Meta{Name: "filter-2", Namespace: "istio-system", GroupVersionKind: gvk.EnvoyFilter},
+			Spec: &networking.EnvoyFilter{
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+					{
+						ApplyTo: networking.EnvoyFilter_HTTP_FILTER,
+						Patch: &networking.EnvoyFilter_Patch{
+							Operation: networking.EnvoyFilter_Patch_INSERT_BEFORE,
+							Value:     buildPatchStruct(`{"name": "filter-2"}`),
+						},
+						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+							Proxy: &networking.EnvoyFilter_ProxyMatch{ProxyVersion: `foobar`},
+						},
+					},
+				},
+				Priority: -1,
+			},
+		},
+	}
+
+	expectedFilterOrder := []string{"test-ns/filter-1", "istio-system/filter-2"}
+	for _, cfg := range envoyFilters {
+		_, _ = store.Create(cfg)
+	}
+	env.ConfigStore = store
+	m := mesh.DefaultMeshConfig()
+	m.RootNamespace = "istio-system"
+	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Init()
+
+	// Init a new push context
+	pc := NewPushContext()
+	pc.Mesh = m
+	pc.initEnvoyFilters(env, nil, nil)
+	got := make([]string, 0)
+	efs := pc.EnvoyFilters(proxy)
+	for _, filter := range efs.Patches[networking.EnvoyFilter_HTTP_FILTER] {
+		got = append(got, filter.Namespace+"/"+filter.Name)
+	}
+	if !slices.Equal(expectedFilterOrder, got) {
+		t.Errorf("Envoy filters are not ordered as expected. expected: %v got: %v", expectedFilterOrder, got)
 	}
 }
 
@@ -2893,6 +2974,69 @@ func TestServiceWithExportTo(t *testing.T) {
 			t.Errorf("proxy in %s namespace: want %+v, got %+v", tt.proxyNs, tt.wantHosts, gotHosts)
 		}
 	}
+}
+
+func TestInstancesByPort(t *testing.T) {
+	ps := NewPushContext()
+	env := NewEnvironment()
+	env.Watcher = mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})
+	ps.Mesh = env.Mesh()
+
+	// Test the Service Entry merge with same host with different generates
+	// correct instances by port.
+	svc5_1 := &Service{
+		Hostname: "svc5",
+		Attributes: ServiceAttributes{
+			Namespace:       "test5",
+			ServiceRegistry: provider.External,
+			ExportTo: sets.New(
+				visibility.Instance("test5"),
+			),
+		},
+		Ports:      port7000,
+		Resolution: DNSLB,
+	}
+	svc5_2 := &Service{
+		Hostname: "svc5",
+		Attributes: ServiceAttributes{
+			Namespace:       "test5",
+			ServiceRegistry: provider.External,
+			ExportTo: sets.New(
+				visibility.Instance("test5"),
+			),
+		},
+		Ports:      port8000,
+		Resolution: DNSLB,
+	}
+
+	env.ServiceDiscovery = &localServiceDiscovery{
+		services: []*Service{svc5_1, svc5_2},
+	}
+
+	env.EndpointIndex.shardsBySvc = map[string]map[string]*EndpointShards{
+		svc5_1.Hostname.String(): {
+			svc5_1.Attributes.Namespace: {
+				Shards: map[ShardKey][]*IstioEndpoint{
+					{Cluster: "Kubernets", Provider: provider.External}: {
+						&IstioEndpoint{
+							Address:         "1.1.1.1",
+							EndpointPort:    7000,
+							ServicePortName: "uds",
+						},
+						&IstioEndpoint{
+							Address:         "1.1.1.2",
+							EndpointPort:    8000,
+							ServicePortName: "uds",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ps.initServiceRegistry(env, nil)
+	instancesByPort := ps.ServiceIndex.instancesByPort[svc5_1.Key()]
+	assert.Equal(t, len(instancesByPort), 2)
 }
 
 func TestGetHostsFromMeshConfig(t *testing.T) {

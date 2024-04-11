@@ -56,10 +56,6 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 	if s.SkipTProxy {
 		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "tproxy")
 	}
-	if s.SkipDelta {
-		// TODO we may also want to trigger this if we have an old version
-		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "delta")
-	}
 	// Allow passing a single CSV flag as well
 	normalized := make(ArrayFlags, 0)
 	for _, sk := range s.SkipWorkloadClasses {
@@ -73,6 +69,10 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 
 	if s.Image.Tag == "" {
 		s.Image.Tag = env.TAG.ValueOrDefault("latest")
+	}
+
+	if s.Image.Variant == "" {
+		s.Image.Variant = env.VARIANT.ValueOrDefault("")
 	}
 
 	if s.Image.PullPolicy == "" {
@@ -172,9 +172,6 @@ func init() {
 	flag.BoolVar(&settingsFromCommandLine.SkipVM, "istio.test.skipVM", settingsFromCommandLine.SkipVM,
 		"Skip VM related parts in all tests.")
 
-	flag.BoolVar(&settingsFromCommandLine.SkipDelta, "istio.test.skipDelta", settingsFromCommandLine.SkipDelta,
-		"Skip Delta XDS related parts in all tests.")
-
 	flag.BoolVar(&settingsFromCommandLine.SkipTProxy, "istio.test.skipTProxy", settingsFromCommandLine.SkipTProxy,
 		"Skip TProxy related parts in all tests.")
 
@@ -196,6 +193,8 @@ func init() {
 		"Container registry hub to use")
 	flag.StringVar(&settingsFromCommandLine.Image.Tag, "istio.test.tag", settingsFromCommandLine.Image.Tag,
 		"Common Container tag to use when deploying container images")
+	flag.StringVar(&settingsFromCommandLine.Image.Variant, "istio.test.variant", settingsFromCommandLine.Image.Variant,
+		"Common Container variant to use when deploying container images")
 	flag.StringVar(&settingsFromCommandLine.Image.PullPolicy, "istio.test.pullpolicy", settingsFromCommandLine.Image.PullPolicy,
 		"Common image pull policy to use when deploying container images")
 	flag.StringVar(&settingsFromCommandLine.Image.PullSecret, "istio.test.imagePullSecret", settingsFromCommandLine.Image.PullSecret,
